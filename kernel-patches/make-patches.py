@@ -557,10 +557,35 @@ the generic EEH failure policy or any other PHB type.
 """)
 
 
+def step_0007_legacy_mm_exports():
+    for symbol in ("__mmdrop", "mmput"):
+        edit("kernel/fork.c", f"EXPORT_SYMBOL_GPL({symbol});",
+             "#if IS_ENABLED(CONFIG_PPC_POWERNV_NVLINK2)\n"
+             "/* Legacy IBM ATS UVM uses this MM lifetime API. */\n"
+             f"EXPORT_SYMBOL({symbol});\n"
+             "#else\n"
+             f"EXPORT_SYMBOL_GPL({symbol});\n"
+             "#endif")
+    commit("""mm: provide compatible lifetime exports for POWER9 NVLink2
+
+The IBM ATS VA-space/mm association in NVIDIA 550.54.15 introduces mmput()
+and __mmdrop() imports. UVM inherits proprietary taint from NVIDIA's core
+module and cannot resolve GPL-only exports of these functions.
+
+Older kernels also exported these functions GPL-only, but allowed UVM's
+Dual MIT/GPL module to use them before proprietary-taint inheritance was
+enforced. Provide non-GPL exports when CONFIG_PPC_POWERNV_NVLINK2 is
+enabled, preserving the current MM implementations and GPL-only exports
+for other configurations. NVIDIA conftest still checks the production
+NPU API and MM export availability before enabling ATS.
+""")
+
+
 TARGETS = {
     "rhel-9.9": (step_0001_phb_probing, step_0002_opal_calls,
                  step_0003_declarations, step_0004_radix_secondary_tlbs,
-                 step_0005_module, step_0006_npu_eeh_ordering),
+                 step_0005_module, step_0006_npu_eeh_ordering,
+                 step_0007_legacy_mm_exports),
 }
 
 

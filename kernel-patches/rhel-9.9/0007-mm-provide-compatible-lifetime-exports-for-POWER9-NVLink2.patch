@@ -1,0 +1,49 @@
+From: eelgaev <3100771+eelgaev@users.noreply.github.com>
+Subject: [PATCH] mm: provide compatible lifetime exports for POWER9 NVLink2
+
+NVIDIA 550.54.15's IBM ATS path requires a VA-space/mm association. Enabling
+that association adds mmput() and __mmdrop() imports to UVM. These symbols
+are GPL-only in the target kernel, and UVM inherits proprietary taint from
+NVIDIA's core module, so the module loader cannot resolve them.
+
+Older kernels also exported these functions GPL-only, but allowed UVM's
+Dual MIT/GPL module to use them before the modern proprietary-taint
+inheritance restriction. Provide non-GPL exports for these two functions
+only when the POWER9 NVLink2 restoration is enabled. Retain their current
+implementations and GPL-only exports for other configurations. NVIDIA's
+conftest must still verify the NPU API and MM export availability.
+
+Signed-off-by: eelgaev <3100771+eelgaev@users.noreply.github.com>
+---
+ kernel/fork.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/kernel/fork.c b/kernel/fork.c
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -965,7 +965,12 @@ void __mmdrop(struct mm_struct *mm)
+ 
+ 	free_mm(mm);
+ }
++#if IS_ENABLED(CONFIG_PPC_POWERNV_NVLINK2)
++/* Legacy IBM ATS UVM uses this MM lifetime API. */
++EXPORT_SYMBOL(__mmdrop);
++#else
+ EXPORT_SYMBOL_GPL(__mmdrop);
++#endif
+ 
+ static void mmdrop_async_fn(struct work_struct *work)
+ {
+@@ -1401,7 +1406,12 @@ void mmput(struct mm_struct *mm)
+ 	if (atomic_dec_and_test(&mm->mm_users))
+ 		__mmput(mm);
+ }
++#if IS_ENABLED(CONFIG_PPC_POWERNV_NVLINK2)
++/* Legacy IBM ATS UVM uses this MM lifetime API. */
++EXPORT_SYMBOL(mmput);
++#else
+ EXPORT_SYMBOL_GPL(mmput);
++#endif
+ 
+ #if defined(CONFIG_MMU) || defined(CONFIG_FUTEX_PRIVATE_HASH)
+ static void mmput_async_fn(struct work_struct *work)

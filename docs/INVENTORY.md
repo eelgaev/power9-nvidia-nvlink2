@@ -70,6 +70,7 @@ the kernel; a module cannot make OPAL calls without an exported wrapper.
 | secondary TLB notification from radix range / mm flushes | present (`mmu_notifier_arch_invalidate_secondary_tlbs()`) | a |
 | secondary TLB notification from `radix__flush_tlb_page_psize()` and `radix__flush_tlb_collapsed_pmd()` | **missing** | c — patch 0004 |
 | `mmu_notifier_*`, `get_user_pages_remote()`, `of_get_ibm_chip_id()` | exported | a |
+| `mmput()` / `__mmdrop()` for NVIDIA UVM's MM association | GPL-only exports | c — patch 0007 provides non-GPL exports for the NVLink2 configuration |
 | memory hotplug for GPU memory (`/sys/devices/system/memory/probe`, `online_movable`, `offline_and_remove_memory()`) | present | — |
 | 256 MiB memory blocks with coherent device memory | present (backported) | — |
 
@@ -80,4 +81,4 @@ the kernel; a module cannot make OPAL calls without an exported wrapper.
 | `follow_pfn()` removed (RHEL 9.6+); `follow_pfnmap_start()` is GPL-only | nvidia patch 0001: conftest; without it, user I/O memory lookup (`cudaHostRegisterIoMemory`) fails cleanly, as in later NVIDIA drivers |
 | `nvidia-drm` vs RHEL 9.9's DRM API | left out of the DKMS build (`apply.sh`); display/KMS only |
 | `pnv_*` symbols live in the nvlink2-npu module | built into the kernel (`CONFIG_PPC_POWERNV_NVLINK2`); their symbol versions come from the kernel's `Module.symvers` |
-| UVM's in-driver IBM ATS path | compiled out on kernels >= 5.9 (`UVM_CAN_USE_MMU_NOTIFIERS()`); the kernel-API path (`NV_PNV_NPU2_INIT_CONTEXT_CALLBACK_RETURNS_VOID`) is used, as on RHEL 8 |
+| UVM's ATS enablement on kernels >= 5.9 | nvidia patch 0002 requires the restored production NPU API and non-GPL `mmput` / `__mmdrop` exports before enabling VA-space/mm support. Kernel patch 0007 supplies the MM compatibility for the NVLink2 configuration. Invalidation remains in the kernel-API path (`NV_PNV_NPU2_INIT_CONTEXT_CALLBACK_RETURNS_VOID`), as on RHEL 8 |

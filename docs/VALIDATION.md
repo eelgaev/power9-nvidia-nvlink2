@@ -1,63 +1,82 @@
-# Hardware validation status
+# Validation guide
 
-## First RHEL 9.9 boot: npu1
+Compilation, module-load compatibility and ATS correctness are separate
+checks. A successful kernel or DKMS build does not establish runtime support.
 
-Build and isolated DKMS checks passed, but the first hardware boot failed.
-These checks establish compilation and symbol compatibility, not runtime
-correctness.
+## Build and export checks
 
-The NPU module loaded, discovered two NPU2 PHBs with eight ATSD register
-sets each, and NVIDIA loaded. GPU memory was also onlined. Subsequently,
-PCI config reads triggered EEH recovery for NPU devices at PE `ffffffff`.
-EEH declared permanent failure and removed the devices. IRQ teardown
-warned about live `NPU Device` handlers, followed by NVIDIA Xids and
-blocked driver calls.
+Run the isolated NVIDIA build against the generated kernel RPMs:
 
-### Identified EEH registration defect
+```sh
+scripts/dkms-test.sh out/RPMS
+```
 
-`pcibios_init()` calls `pci_bus_add_devices()` before the platform final
-fixup. The restored NPU controller has no DMA setup hook, so the early
-EEH probe copies an unassigned PE (`IODA_INVALID_PE`, -1) from the
-reverse map. The final fixup later assigns the PCI PEs but does not
-refresh the already-created EEH entries.
+This uses private source and DKMS trees. It checks the restored NPU API
+imports and rejects GPL-only kernel imports from NVIDIA's core and UVM
+modules. It does not install or load the modules.
 
-An all-ones config read reaches `pnv_ioda_get_pe_state()` with this
-invalid PE. It returns permanently unavailable without calling firmware.
-The RHEL 8 EEH core treats `EEH_STATE_NOT_SUPPORT` as a false positive;
-RHEL 9.9's EEH core can instead start recovery and device removal.
+NVIDIA UVM is Dual MIT/GPL, but inherits proprietary taint when it resolves
+symbols from NVIDIA's proprietary core module. The module loader then rejects
+GPL-only kernel exports. In particular, enabling VA-space/mm support adds
+`mmput` and `__mmdrop` imports. NVIDIA patch 0002 requires usable non-GPL
+exports of both functions, in addition to the restored production NPU API,
+before enabling ATS on newer kernels. Kernel patch 0007 supplies non-GPL
+MM exports when `CONFIG_PPC_POWERNV_NVLINK2` is enabled. A kernel lacking
+that compatibility retains the restriction; a driver reload or reboot into
+the same incompatible kernel does not resolve it.
 
-Patch **0006** defers NPU EEH probing while its PE is unassigned, then
-completes registration after NPU PE setup. It does not weaken the generic
-EEH failure policy, affect other PHB types, or alter the ATS module source.
-The correction is built under a distinct **npu2** release. A successful
-build is not proof that the hardware failure is resolved.
+Verify that both NVIDIA patches were applied to the target build. When
+updating an existing DKMS entry, explicitly rebuild before installation;
+installation alone can reuse an older build. See [INSTALL.md](INSTALL.md).
 
-The `npu2` kernel and kernel-devel RPM build passed in the UBI 8 container
-with gcc-toolset-13. The RPM payload contains the correction and NPU
-module, and its NPU export CRCs match `npu1`. The ATS source files are
-unchanged. `npu2` has not yet been validated on hardware.
+## Hardware preflight
 
-### Earlier unresolved events
+Use a controlled test with automatic GPU workloads held back. Before CUDA
+queries or tests:
 
-Before the EEH removal, the first boot also logged a recovered memory
-failure at a GPU-memory PFN and a NVIDIA DMA-range rejection. The rejected
-DMA address corresponded to CPU node 8 RAM plus the PCI bypass offset,
-outside the driver's reported addressable range. These events require
-separate validation; patch 0006 does not claim to fix them.
+- Confirm the selected kernel and loaded NVIDIA/NPU modules.
+- Inspect the kernel log for EEH device removals, invalid PE registrations,
+  module-load errors, DMA-range failures, Xids, memory failures, KFENCE reports
+  and blocked driver calls. Resolve these before progressing.
+- Confirm the NPU PCI devices are present. For each device, inspect
+  `/sys/bus/pci/devices/<BDF>/eeh_pe_config_addr`: the saved PE must match the
+  assigned PCI PE, rather than `0xffffffff`.
 
-## Next hardware test
+Kernel patch 0006 defers NPU EEH probing until PE assignment is complete. It
+addresses invalid initial EEH registrations; it does not establish that other
+memory, DMA or driver failures are resolved.
 
-Perform the next boot as a controlled test with automatic GPU workloads
-held back. First inspect the kernel log and verify NPU device presence and
-driver initialization. Only proceed to bandwidth and ATS stress tests
-once there are no EEH removals, DMA-range failures, Xids or blocked calls.
+If EEH has removed devices or the driver is blocked, return to the known-working
+kernel through the firmware boot menu. See [BOOT.md](BOOT.md).
 
-For each NPU PCI device, inspect its saved
-`/sys/bus/pci/devices/<BDF>/eeh_pe_config_addr`: it must contain the PE
-assigned during NPU setup, not `0xffffffff`. `tests/verify.sh` checks
-these registrations on the restored-module kernel and stops before GPU
-queries or CUDA tests if this preflight or the kernel-log check fails.
+## Capability and small functional tests
 
-If the driver is already blocked or EEH has removed NPU devices, return
-to the known-working stock kernel through the firmware boot menu rather
-than attempting live module reloads or device recovery during the test.
+After preflight passes, check GPU visibility, NVLink status and GPU NUMA memory
+status, then run small transfer and read tests:
+
+```sh
+cd tests
+./bw h2d -d 0 -m 64 &&
+./bw d2h -d 0 -m 64 &&
+./ats_read -d 0 -m 64 -r 2
+```
+
+Host transfer bandwidth and a passing managed-memory checksum do not prove
+ATS. The read test must report pageable memory access and actually run the
+plain malloc test. If that test is skipped, ATS has not been validated.
+
+## ATS invalidation tests
+
+Only after the capability/read check passes and the kernel log remains clean:
+
+```sh
+./ats_stress -d 0 -m 64 -s 2 -r 5
+```
+
+The test must report pageable memory access via host page tables and execute
+its invalidation phases. An "ATS not available" result is a skipped test,
+not a successful ATS validation. Inspect checksums and the kernel log before
+increasing the allocation or iteration count or testing additional GPUs.
+
+Keep exact build identifiers, measurements and boot logs in local validation
+records rather than the public installation instructions.

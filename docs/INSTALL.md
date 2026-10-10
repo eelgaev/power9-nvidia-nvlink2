@@ -16,6 +16,10 @@ selecting the new kernel.
 
 ## 1. Build the kernel RPMs
 
+Use the kernel release printed by the build in the commands below.
+See [VALIDATION.md](VALIDATION.md) for compatibility checks and the hardware
+validation procedure.
+
 On a ppc64le machine with podman:
 
 ```sh
@@ -48,10 +52,21 @@ To correct packaging of an existing build without recompiling:
 bash kernel-patches/repackage-kernel.sh out [jobs]
 ```
 
+To apply additional patches and incrementally rebuild a saved compiled tree:
+
+```sh
+bash kernel-patches/rebuild-kernel.sh previous-out additional-patches \
+    out-next '<build-suffix>' [jobs]
+```
+
+The additional patch directory must contain only patches not yet applied to
+the saved tree. The new output directory must not exist; the previous output
+is mounted read-only. The compiler and packaging settings match the full build.
+
 | Package | Install? |
 |---|---|
-| `kernel-5.14.0_741.9.1.npu2.el9_9.ppc64le-1` | yes: `/boot`, `/lib/modules` (incl. the nvlink2-npu module) |
-| `kernel-devel-5.14.0_741.9.1.npu2.el9_9.ppc64le-1` | yes: build tree for DKMS |
+| `kernel-…` | yes: `/boot`, `/lib/modules` (incl. the nvlink2-npu module) |
+| `kernel-devel-…` | yes: build tree for DKMS |
 | `kernel-headers-…` | **no**: would replace the distribution's userspace kernel headers |
 
 ## 2. Install the kernel next to the existing ones
@@ -80,16 +95,34 @@ Needs `gcc-toolset-13-gcc` (RHEL 8 and 9 AppStream): DKMS builds through
 `kmake`, which picks the compiler the kernel was built with.
 
 ```sh
-nvidia-patches/550.54.15/apply.sh
-dkms install nvidia/550.54.15 -k 5.14.0-741.9.1.npu2.el9_9.ppc64le --force
+KVER='<kernel-release>'
+nvidia-patches/550.54.15/apply.sh &&
+dkms build nvidia/550.54.15 -k "$KVER" --force &&
+dkms install nvidia/550.54.15 -k "$KVER" --force
 ```
 
-`apply.sh` registers the follow_pfn patch with NVIDIA's DKMS package (DKMS
-applies it to its build copy; `/usr/src/nvidia-550.54.15` stays as
-shipped), runs the build through `kmake`, and leaves out `nvidia-drm`
+`apply.sh` registers the follow_pfn and ATS enablement patches with NVIDIA's
+DKMS package (DKMS applies them to its build copy;
+`/usr/src/nvidia-550.54.15` stays as shipped), runs the build through `kmake`,
+and leaves out `nvidia-drm`
 (display/KMS glue, unused on compute systems; it does not build against
-RHEL 9.9's newer DRM API). Builds for other kernels get the same settings;
-the patch is a no-op there.
+RHEL 9.9's newer DRM API). Rerunning it adds newly introduced patches to an
+already configured source tree without duplicating existing entries. Builds
+for other kernels get the same settings; the compatibility changes preserve
+the existing RHEL 8 behavior.
+
+The explicit build step is required when updating an existing build for the
+same kernel release: installing an already-built DKMS entry alone can reuse
+the old modules. Confirm patch registration and application:
+
+```sh
+grep '^PATCH\[' /usr/src/nvidia-550.54.15/dkms.conf
+grep 'Applying patch' \
+    "/var/lib/dkms/nvidia/550.54.15/$KVER/ppc64le/log/make.log"
+```
+
+Both checks must list patches 0001 and 0002. Activate the updated modules at
+the next controlled boot before checking CUDA's ATS capabilities.
 
 Check that the driver uses the NPU API (i.e. conftest found it):
 
@@ -101,9 +134,20 @@ modprobe --dump-modversions \
 It must list `pnv_pci_get_npu_dev`, `pnv_npu2_init_context` and
 `pnv_npu2_destroy_context`. `scripts/dkms-test.sh` runs the whole DKMS
 build in a scratch tree and performs these checks without installing
-anything.
+anything. Symbol imports alone do not establish that ATS is enabled: UVM's
+VA-space/mm support must also be enabled. Patch 0002 checks that the restored
+NPU API and non-GPL MM lifecycle exports are available. With GPL-only
+`mmput` or `__mmdrop` exports, UVM remains loadable but ATS stays disabled.
+Kernel patch 0007 provides non-GPL exports of these two functions when
+`CONFIG_PPC_POWERNV_NVLINK2` is enabled, supplying this compatibility.
 
-## 5. Boot and verify
+The isolated build check rejects GPL-only imports from NVIDIA's core and UVM
+modules, which compilation alone can miss. After the updated modules are loaded,
+`ats_read` must report pageable memory access and pass both malloc and managed
+checks, and `ats_stress` must report host-page-table ATS and actually run its
+invalidation phases.
+
+## 4. Boot and verify
 
 Boot the new kernel (see [BOOT.md](BOOT.md)), then:
 

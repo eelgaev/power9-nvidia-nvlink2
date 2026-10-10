@@ -66,5 +66,18 @@ for want in "nvidia.ko pnv_pci_get_npu_dev" \
 	fi
 done
 
+# nvidia.ko is proprietary; UVM inherits that taint when resolving its RM
+# imports. Compilation alone can therefore miss GPL-only kernel imports
+# which the module loader will reject even though UVM is Dual MIT/GPL.
+echo "== kernel export compatibility (static check)"
+for ko in "$m"/nvidia.ko* "$m"/nvidia-uvm.ko*; do
+	while read -r crc symbol; do
+		if grep -Eq "^[^[:space:]]+[[:space:]]+$symbol[[:space:]]+[^[:space:]]+[[:space:]]+EXPORT_SYMBOL_GPL([[:space:]]|$)" "$KDIR/Module.symvers"; then
+			echo "  LOAD BLOCKER: $(basename "$ko") imports GPL-only $symbol"
+			fail=1
+		fi
+	done < <(modprobe --dump-modversions "$ko")
+done
+
 (( fail )) && echo FAIL || echo PASS
 exit $fail

@@ -43,7 +43,8 @@ When petitboot's menu appears it shows a countdown ("Booting in N sec");
 
 1. Note which entry is highlighted / marked as default: that is what an
    unattended reboot will boot.
-2. Select `Red Hat Enterprise Linux (5.14.0-741.9.1.npu2.el9_9.ppc64le)` and
+2. Select the newly built entry, shown as
+   `Red Hat Enterprise Linux (<kernel-release>)`, and
    press Enter. (`e` edits the entry's command line for this boot only.)
 
 To get more time to react, raise the autoboot timeout from petitboot's
@@ -60,5 +61,5 @@ the console: petitboot autoboots the default entry, which is unchanged.
 ## 5. Remove the test kernel
 
 ```sh
-rpm -e kernel-5.14.0_741.9.1.npu2.el9_9.ppc64le kernel-devel-5.14.0_741.9.1.npu2.el9_9.ppc64le
+rpm -e 'kernel-<package-version>' 'kernel-devel-<package-version>'
 ```

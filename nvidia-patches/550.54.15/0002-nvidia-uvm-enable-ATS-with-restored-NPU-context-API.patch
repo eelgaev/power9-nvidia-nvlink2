@@ -1,0 +1,63 @@
+From: eelgaev <3100771+eelgaev@users.noreply.github.com>
+Subject: [PATCH] nvidia-uvm: check NPU and MM APIs before enabling ATS
+
+UVM_CAN_USE_MMU_NOTIFIERS() excludes PPC64LE kernels >= 5.9 even when
+conftest detects the production pnv_npu2_init_context() callback API.
+uvm_ats_init() also requires uvm_va_space_mm_enabled_system(), which uses
+this macro, so selecting the kernel ATS implementation alone is not
+enough: CUDA still reports no pageable-memory access.
+
+The restored NPU API alone is insufficient: enabling VA-space/mm support
+also introduces mmput() and __mmdrop() imports. UVM inherits proprietary
+taint from nvidia.ko and cannot resolve GPL-only exports of these functions.
+Check both export presence and export type using NVIDIA's existing symbol
+conftests before enabling the newer-kernel path. This keeps UVM loadable
+with ATS disabled on kernels whose MM lifecycle exports are unusable.
+
+Keep the existing notifier and architecture checks and require the
+production NPU context API, which selects kernel-provided invalidation.
+The pre-5.9 path retains its existing behavior.
+
+Signed-off-by: eelgaev <3100771+eelgaev@users.noreply.github.com>
+---
+ nvidia-uvm/nvidia-uvm.Kbuild |  4 ++++
+ nvidia-uvm/uvm_linux.h      | 13 ++++++++++++-
+ 2 files changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/nvidia-uvm/nvidia-uvm.Kbuild b/nvidia-uvm/nvidia-uvm.Kbuild
+--- a/nvidia-uvm/nvidia-uvm.Kbuild
++++ b/nvidia-uvm/nvidia-uvm.Kbuild
+@@ -117,3 +117,7 @@ NV_CONFTEST_TYPE_COMPILE_TESTS += mmu_interval_notifier
+ 
+ NV_CONFTEST_SYMBOL_COMPILE_TESTS += is_export_symbol_present_int_active_memcg
+ NV_CONFTEST_SYMBOL_COMPILE_TESTS += is_export_symbol_present_migrate_vma_setup
++NV_CONFTEST_SYMBOL_COMPILE_TESTS += is_export_symbol_present_mmput
++NV_CONFTEST_SYMBOL_COMPILE_TESTS += is_export_symbol_gpl_mmput
++NV_CONFTEST_SYMBOL_COMPILE_TESTS += is_export_symbol_present___mmdrop
++NV_CONFTEST_SYMBOL_COMPILE_TESTS += is_export_symbol_gpl___mmdrop
+
+diff --git a/nvidia-uvm/uvm_linux.h b/nvidia-uvm/uvm_linux.h
+--- a/nvidia-uvm/uvm_linux.h
++++ b/nvidia-uvm/uvm_linux.h
+@@ -128,9 +128,20 @@ static inline const struct cpumask *uvm_cpumask_of_node(int node)
+ // The callback was added in commit 0f0a327fa12cd55de5e7f8c05a70ac3d047f405e,
+ // v3.19 (2014-11-13) and renamed in commit 1af5a8109904.
++//
++// Newer kernels need both the production NPU API and usable MM lifecycle
++// exports. UVM inherits proprietary taint from nvidia.ko, so GPL-only
++// mmput()/__mmdrop() exports cannot support the VA-space/mm association
++// required by uvm_ats_init().
+     #if (defined(NV_MMU_NOTIFIER_OPS_HAS_INVALIDATE_RANGE) || \
+          defined(NV_MMU_NOTIFIER_OPS_HAS_ARCH_INVALIDATE_SECONDARY_TLBS)) && \
+-        defined(NVCPU_PPC64LE) && LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
++        defined(NVCPU_PPC64LE) && \
++        (LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0) || \
++         (defined(NV_PNV_NPU2_INIT_CONTEXT_CALLBACK_RETURNS_VOID) && \
++          NV_IS_EXPORT_SYMBOL_PRESENT_mmput && \
++          !NV_IS_EXPORT_SYMBOL_GPL_mmput && \
++          NV_IS_EXPORT_SYMBOL_PRESENT___mmdrop && \
++          !NV_IS_EXPORT_SYMBOL_GPL___mmdrop))
+         #define UVM_CAN_USE_MMU_NOTIFIERS() 1
+     #else
+         #define UVM_CAN_USE_MMU_NOTIFIERS() 0
+     #endif

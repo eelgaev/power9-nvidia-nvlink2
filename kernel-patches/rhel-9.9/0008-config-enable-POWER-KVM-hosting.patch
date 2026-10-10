@@ -1,0 +1,24 @@
+From: eelgaev <3100771+eelgaev@users.noreply.github.com>
+Subject: [PATCH] config: enable POWER KVM hosting
+
+The RHEL 9 ppc64le base configuration enables virtualization guest support
+but disables the Book3S 64-bit KVM host. Enable the KVM core and its POWER
+hypervisor-mode backend as modules so the kernel can also host VMs.
+olddefconfig resolves the supporting handlers and dependencies.
+
+This single-setting hunk applies to both the vendor configuration and a
+previously resolved configuration, whose surrounding entries differ.
+
+Signed-off-by: eelgaev <3100771+eelgaev@users.noreply.github.com>
+---
+ .config | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/.config b/.config
+--- a/.config
++++ b/.config
+@@ -2738 +2738,3 @@
+-# CONFIG_KVM_BOOK3S_64 is not set
++# Enable POWER KVM hosting: core and hardware hypervisor backend.
++CONFIG_KVM_BOOK3S_64=m
++CONFIG_KVM_BOOK3S_64_HV=m

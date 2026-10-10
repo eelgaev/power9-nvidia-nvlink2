@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Register the nvlink2-npu kernel patch with NVIDIA's DKMS package.
+# Register the POWER9 NVLink2 compatibility patches with NVIDIA's DKMS package.
 #
 #   apply.sh [nvidia DKMS source dir]     (default /usr/src/nvidia-550.54.15)
 #
@@ -34,21 +34,25 @@ mkdir -p "$DIR/patches"
 cp "$HERE"/0*.patch "$DIR/patches/"
 cp "$HERE/../../scripts/kmake" "$DIR/kmake"
 
+cp -n "$CONF" "$CONF.orig"
+# Add newly introduced patches even if this source tree already uses kmake.
+# Keep existing PATCH entries and choose an unused index for each addition.
+i=0
+for p in "$HERE"/0*.patch; do
+	name=${p##*/}
+	registered=$(grep -E '^PATCH\[[0-9]+\]=' "$CONF" || true)
+	[[ $registered == *"=\"$name\""* ]] && continue
+	while grep -q "^PATCH\[$i\]=" "$CONF"; do
+		i=$((i + 1))
+	done
+	printf '\nPATCH[%d]="%s"\n' "$i" "$name" >> "$CONF"
+done
+
 if grep -q 'kmake' "$CONF"; then
 	echo "$CONF already set up for power9-nvlink2"
 	exit 0
 fi
 
-cp -n "$CONF" "$CONF.orig"
-{
-	echo
-	echo "# power9-nvlink2: follow_pfn conftest for kernels where follow_pfn() was removed"
-	i=0
-	for p in "$HERE"/0*.patch; do
-		echo "PATCH[$i]=\"$(basename "$p")\""
-		i=$((i + 1))
-	done
-} >> "$CONF"
 # Build with the target kernel's compiler and leave out nvidia-drm
 grep -q '^BUILT_MODULE_NAME\[2\]="nvidia-drm"' "$CONF" ||
 	{ echo "unexpected module list in $CONF" >&2; exit 1; }

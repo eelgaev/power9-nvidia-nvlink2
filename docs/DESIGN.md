@@ -36,6 +36,7 @@ notifier infrastructure.
     0004  notify secondary TLBs on single-page radix flushes    (correctness)
     0005  the nvlink2-npu module (src/)                   (CONFIG_PPC_POWERNV_NVLINK2)
     0006  defer NPU EEH registration until its PEs exist       (initialization order)
+    0007  compatible MM lifetime export types for NVLink2 UVM (driver compatibility)
 ```
 
 ## Why these are kernel patches (not module code)
@@ -58,6 +59,12 @@ notifier infrastructure.
   what copy-on-write, page migration, reclaim and KSM use. Missing them
   leaves stale GPU translations: silent memory corruption. (A module could
   only work around this with kprobes on a hot path.)
+- **0007** — UVM's VA-space/mm association imports `mmput()` and
+  `__mmdrop()`. Their GPL-only export types prevent loading UVM after it
+  inherits proprietary taint from NVIDIA's core module. With
+  `CONFIG_PPC_POWERNV_NVLINK2` enabled, this patch provides non-GPL exports
+  of these two functions. Their MM lifetime implementations remain the
+  current kernel implementations; other configurations retain GPL-only exports.
 
 The module itself (0005) is a tristate (`=m`) so a failure to load its
 init does not keep the system from booting, and so the ATSD/GPU mapping
@@ -89,9 +96,16 @@ modules import its symbols, so it always loads first.
 ## NVIDIA driver path
 
 UVM has two IBM ATS implementations: through the kernel API
-(`pnv_npu2_init_context()`), and inside the driver. The in-driver one is
-compiled out on kernels >= 5.9 (`UVM_CAN_USE_MMU_NOTIFIERS()`), so on 9.9
-the kernel-API path is the only option — the same one RHEL 8 uses today.
+(`pnv_npu2_init_context()`), and inside the driver. Detection of the production
+NPU context callback API selects the kernel implementation, as on RHEL 8.
+
+The original version gate in `UVM_CAN_USE_MMU_NOTIFIERS()` also disables
+UVM's VA-space/mm association on newer kernels, preventing global ATS
+enablement even when the kernel implementation is compiled. NVIDIA patch
+0002 requires the production NPU API and usable non-GPL MM lifetime exports
+before allowing that association. Kernel patch 0007 supplies compatible MM
+export types for this platform configuration. Kernel-provided invalidation
+remains the selected path.
 
 ## Not restored
 

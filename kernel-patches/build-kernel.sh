@@ -24,7 +24,7 @@ PATCHES=$(realpath "${2:?patch dir}")
 OUT=$(realpath -m "${3:?output dir}")
 JOBS=${4:-$(( $(nproc) / 2 ))}
 IMAGE=${IMAGE:-p9-nvlink2-el8}
-SUFFIX=${SUFFIX:-npu2}
+SUFFIX=${SUFFIX:-npu3}
 
 mkdir -p "$OUT"
 
@@ -44,16 +44,17 @@ tar -xf linux-*.tar.xz
 cd linux-*/
 # RHEL version macros (RHEL_MAJOR, ...), as the RHEL spec does in %prep
 cp ../Makefile.rhelver .
+# Load the base config before the series so its KVM config patch can apply.
+cp ../kernel-ppc64le-rhel.config .config
 for p in /in/patches/0*.patch; do
 	echo "applying $(basename "$p")"
 	patch -p1 -s < "$p"
 done
 
-# RHEL release of the SRPM, e.g. 741.9.1.el9_9 -> 5.14.0-741.9.1.npu2.el9_9.ppc64le
+# RHEL release of the SRPM, e.g. 741.9.1.el9_9 -> 5.14.0-741.9.1.npu3.el9_9.ppc64le
 rel=$(basename "$PWD" | sed "s/^linux-[0-9.]*-//")
 krel="-${rel%%.el*}.$SUFFIX.el${rel#*.el}.ppc64le"
 
-cp ../kernel-ppc64le-rhel.config .config
 scripts/config --disable WERROR \
 	--disable DEBUG_INFO --disable DEBUG_INFO_BTF \
 	--disable DEBUG_INFO_BTF_MODULES \
