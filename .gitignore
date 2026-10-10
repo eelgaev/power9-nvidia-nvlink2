@@ -1,0 +1,22 @@
+# kernel module build output
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
+
+# test binaries
+tests/ats_read
+tests/ats_stress
+tests/bw
+
+# build output
+out/
+*.rpm
+*.log
+__pycache__/
+/dkms-test*/

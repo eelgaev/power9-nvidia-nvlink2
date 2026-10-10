@@ -1,0 +1,60 @@
+From: eelgaev <3100771+eelgaev@users.noreply.github.com>
+Subject: [PATCH 6/6] powerpc/powernv: defer NPU EEH probing until PEs are assigned
+
+pcibios_init() adds PCI devices before calling the final platform fixup.
+The restored NPU controller has no DMA device setup hook, and assigns
+its PEs only in pnv_pci_ioda_setup_nvlink(). The earlier EEH probe thus
+records IODA_INVALID_PE (-1) in pe_config_addr, even though the final
+fixup subsequently fills in the PCI reverse map.
+
+An all-ones config read then queries the invalid EEH PE. The IODA state
+helper returns permanently unavailable without consulting firmware.
+Unlike the RHEL 8 kernel, RHEL 9.9 can treat EEH_STATE_NOT_SUPPORT as
+a failure, triggering recovery and removal of live NPU devices.
+
+Defer probing of NVLink NPU devices with unassigned PEs, then complete
+their EEH registration immediately after NPU PE setup. Do not change
+the generic EEH failure policy or any other PHB type.
+
+Signed-off-by: eelgaev <3100771+eelgaev@users.noreply.github.com>
+---
+diff --git a/arch/powerpc/platforms/powernv/eeh-powernv.c b/arch/powerpc/platforms/powernv/eeh-powernv.c
+--- a/arch/powerpc/platforms/powernv/eeh-powernv.c
++++ b/arch/powerpc/platforms/powernv/eeh-powernv.c
+@@ -339,6 +339,11 @@ static struct eeh_dev *pnv_eeh_probe(struct pci_dev *pdev)
+ 	if (!edev || edev->pe)
+ 		return NULL;
+ 
++	/* NPU PEs are assigned in the final PCI fixup, after device addition. */
++	if (phb->type == PNV_PHB_NPU_NVLINK &&
++	    pdn->pe_number == IODA_INVALID_PE)
++		return NULL;
++
+ 	/* already configured? */
+ 	if (edev->pdev) {
+ 		pr_debug("%s: found existing edev for %04x:%02x:%02x.%01x\n",
+diff --git a/arch/powerpc/platforms/powernv/pci-ioda.c b/arch/powerpc/platforms/powernv/pci-ioda.c
+--- a/arch/powerpc/platforms/powernv/pci-ioda.c
++++ b/arch/powerpc/platforms/powernv/pci-ioda.c
+@@ -24,6 +24,7 @@
+ #include <linux/of_address.h>
+ #include <linux/of_irq.h>
+ 
++#include <asm/eeh.h>
+ #include <asm/sections.h>
+ #include <asm/io.h>
+ #include <asm/pci-bridge.h>
+@@ -1118,6 +1118,13 @@ static void pnv_pci_ioda_setup_nvlink(void)
+ 		pnv_ioda_reserve_pe(phb, 0);
+ 		list_for_each_entry(pdev, &hose->bus->devices, bus_list)
+ 			pnv_ioda_setup_npu_PE(pdev);
++
++#ifdef CONFIG_EEH
++		/* Complete deferred EEH registration with valid PE mappings. */
++		list_for_each_entry(pdev, &hose->bus->devices, bus_list)
++			if (!pci_dev_to_eeh_dev(pdev))
++				eeh_probe_device(pdev);
++#endif
+ 	}
+ }
+ 

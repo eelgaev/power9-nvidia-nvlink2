@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# kmake: run a command with the C compiler the target kernel was built with.
+#
+#   kmake <kernel build dir> <command> [args...]
+#
+# Reads CONFIG_CC_VERSION_TEXT from the kernel's .config and puts the
+# matching gcc first in PATH: the system gcc or one of the gcc-toolset
+# installs (/opt/rh/gcc-toolset-*). Kbuild re-derives configuration from the
+# compiler it finds, so building a module with a different compiler than the
+# kernel's can silently change code generation (e.g. the ftrace scheme).
+# Used by the NVIDIA driver's DKMS configuration.
+set -euo pipefail
+
+KDIR=${1:?usage: $0 <kernel build dir> <command> [args...]}
+shift
+
+want=$(sed -n 's/^CONFIG_CC_VERSION_TEXT="\(.*\)"$/\1/p' "$KDIR/.config" 2>/dev/null || true)
+if [[ -z $want ]]; then
+	echo "kmake: no CONFIG_CC_VERSION_TEXT in $KDIR/.config, using default gcc" >&2
+	exec "$@"
+fi
+
+for cc in gcc /opt/rh/gcc-toolset-*/root/usr/bin/gcc; do
+	command -v "$cc" >/dev/null 2>&1 || continue
+	if [[ $("$cc" --version 2>/dev/null | head -1) == "$want" ]]; then
+		dir=$(dirname "$(command -v "$cc")")
+		echo "kmake: using $dir/gcc ($want)" >&2
+		export PATH="$dir:$PATH"
+		exec "$@"
+	fi
+done
+
+echo "kmake: $KDIR was built with \"$want\", which is not installed." >&2
+echo "kmake: install it (on RHEL 8/9: the matching gcc-toolset-NN-gcc package)." >&2
+exit 1

@@ -1,0 +1,51 @@
+Credits
+-------
+
+This project contains no new hardware support. It carries the POWER9 NPU2
+(NVLink2) code that Linux shipped from v4.5 to v5.12 — and that Red Hat
+Enterprise Linux 8 still ships — over to kernels that no longer have it,
+with the smallest changes needed. The people below wrote that code; any
+bugs introduced by moving it are this project's own.
+
+Original NPU / NVLink code (arch/powerpc/platforms/powernv/npu-dma.c and
+the NVLink parts of pci-ioda.c), from the upstream history of
+npu-dma.c up to v5.12 (65 commits):
+
+  Alistair Popple        NVLink NPU support (5d2aa710e697, v4.5); NVLink2
+                         address translation services (1ab66d1fbada, v4.12)
+                         and the context API fixes (a1409adac748,
+                         28a5933e8d36); ATSD / nest MMU flush ordering;
+                         author of npu-dma.c (Copyright IBM Corporation 2015)
+  Alexey Kardashevskiy   NPU IOMMU / TCE handling, NVLink pass-through,
+                         moving OPAL context calls out of the context code
+                         (0e759bd75285), faulting pages for the GPU
+                         (58629c0dc349), mmio-atsd bounds checks
+  Mark Hairgrove         size-based ATSD invalidates (3689c37d23fc), fewer
+                         barriers per ATSD (7ead15a1442b), notifier
+                         registration failure fix (720c84046c26) (NVIDIA)
+  Oliver O'Halloran      IOMMU group setup for NPU and PCI PEs
+  Reza Arbab             ATSD register allocation race (9eab9901b015)
+  Frederic Barrat        separate PHB type for NPU2 OpenCAPI links
+                         (7f2c39e91f61)
+  Michael Ellerman       build fixes, MMIO accessors
+  Benjamin Herrenschmidt, Russell Currey, Daniel Axtens, Greg Kurz,
+  Jérôme Glisse, Peter Xu, Thomas Gleixner, Heiner Kallweit, Dan Carpenter,
+  Bart Van Assche, Krzysztof Kozlowski, Adam Buchbinder, Christoph Hellwig,
+  Linus Torvalds — fixes and API updates along the way.
+
+Code this project depends on, already in RHEL 9:
+
+  Aneesh Kumar K.V       256 MiB memory blocks with coherent device memory
+                         (4d15721177d5, 4c33bf147249), so GPU memory onlines
+                         without losing a 1 GiB block per GPU
+  Alistair Popple        secondary TLB invalidation from the architecture
+                         TLB flush code (1af5a8109904 and series), which
+                         the module's ATSD path hooks into
+
+The firmware side (skiboot NPU2 support) and the GPU driver side
+(nv-ibmnpu, nvidia-uvm IBM ATS) are by IBM and NVIDIA respectively and are
+used unmodified, apart from the follow_pfn build fix in nvidia-patches/.
+
+Removal history, for reference: 7eb3cf761927 ("powerpc/powernv: remove
+unused NPU DMA code", v5.3) and 562d1e207d32 ("powerpc/powernv: remove the
+nvlink support", v5.13).

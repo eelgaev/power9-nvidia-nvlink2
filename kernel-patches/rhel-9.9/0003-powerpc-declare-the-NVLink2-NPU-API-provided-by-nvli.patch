@@ -1,0 +1,72 @@
+From 830343428ae75242459e809f1e6cfa08e12ad0f7 Mon Sep 17 00:00:00 2001
+From: eelgaev <3100771+eelgaev@users.noreply.github.com>
+Subject: [PATCH 3/6] powerpc: declare the NVLink2 NPU API provided by
+ nvlink2-npu
+
+The NPU2 ATS / context API (pnv_npu2_init_context() etc.) and the NPU
+device lookup helpers were removed in commits 7eb3cf761927 and
+562d1e207d32. They are implemented by the nvlink2-npu module (see the
+next patch), with the same names and signatures as before.
+
+Declare them in the headers they used to live in. GPU drivers detect the
+API by compiling against these declarations (e.g. NVIDIA's conftest
+checks <linux/pci.h> and <asm/powernv.h>); the symbols themselves are
+resolved against the module at load time.
+
+Signed-off-by: eelgaev <3100771+eelgaev@users.noreply.github.com>
+---
+ arch/powerpc/include/asm/pci.h     | 11 +++++++++++
+ arch/powerpc/include/asm/powernv.h | 18 ++++++++++++++++++
+ 2 files changed, 29 insertions(+)
+
+diff --git a/arch/powerpc/include/asm/pci.h b/arch/powerpc/include/asm/pci.h
+index f9da50675..d81fcc449 100644
+--- a/arch/powerpc/include/asm/pci.h
++++ b/arch/powerpc/include/asm/pci.h
+@@ -118,4 +118,15 @@ extern void pcibios_scan_phb(struct pci_controller *hose);
+ 
+ #endif	/* __KERNEL__ */
+ 
++/*
++ * NVLink2 NPU helpers. Provided by the nvlink2-npu module
++ * (CONFIG_PPC_POWERNV_NVLINK2); declared here because GPU drivers look for
++ * them in this header.
++ */
++extern struct pci_dev *pnv_pci_get_gpu_dev(struct pci_dev *npdev);
++extern struct pci_dev *pnv_pci_get_npu_dev(struct pci_dev *gpdev, int index);
++extern int pnv_npu2_map_lpar_dev(struct pci_dev *gpdev, unsigned int lparid,
++		unsigned long msr);
++extern int pnv_npu2_unmap_lpar_dev(struct pci_dev *gpdev);
++
+ #endif /* __ASM_POWERPC_PCI_H */
+diff --git a/arch/powerpc/include/asm/powernv.h b/arch/powerpc/include/asm/powernv.h
+index e1a858718..fae1b81f4 100644
+--- a/arch/powerpc/include/asm/powernv.h
++++ b/arch/powerpc/include/asm/powernv.h
+@@ -9,6 +9,24 @@
+ #ifdef CONFIG_PPC_POWERNV
+ extern void powernv_set_nmmu_ptcr(unsigned long ptcr);
+ 
++/*
++ * NVLink2 address translation services (ATS). Provided by the nvlink2-npu
++ * module (CONFIG_PPC_POWERNV_NVLINK2); declared here because GPU drivers
++ * look for them in this header.
++ */
++#define NPU2_WRITE 1
++struct npu_context;
++struct pci_dev;
++extern struct npu_context *pnv_npu2_init_context(struct pci_dev *gpdev,
++			unsigned long flags,
++			void (*cb)(struct npu_context *, void *),
++			void *priv);
++extern void pnv_npu2_destroy_context(struct npu_context *context,
++				struct pci_dev *gpdev);
++extern int pnv_npu2_handle_fault(struct npu_context *context, uintptr_t *ea,
++				unsigned long *flags, unsigned long *status,
++				int count);
++
+ void pnv_program_cpu_hotplug_lpcr(unsigned int cpu, u64 lpcr_val);
+ 
+ void pnv_tm_init(void);
+-- 
+2.43.7

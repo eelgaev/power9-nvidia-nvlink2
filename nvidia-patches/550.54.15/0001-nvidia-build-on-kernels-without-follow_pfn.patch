@@ -1,0 +1,84 @@
+From 5eda785ab1f57c578a957f41c5dbc6ebedea112a Mon Sep 17 00:00:00 2001
+From: eelgaev <3100771+eelgaev@users.noreply.github.com>
+Subject: [PATCH] nvidia: build on kernels without follow_pfn()
+
+follow_pfn() was removed in Linux 6.10, and RHEL 9 kernels from 9.6 on
+carry the removal, so 550.54.15 fails to build there (nvidia/os-mlock.c).
+Its replacement, follow_pfnmap_start(), is exported GPL-only and cannot
+be used by nvidia.ko.
+
+Add a conftest for follow_pfn() and, when it is absent, make
+nv_follow_pfn() fail: looking up user I/O memory
+(os_lookup_user_io_memory(), e.g. cudaHostRegisterIoMemory) is then not
+supported, which is what later NVIDIA drivers do on such kernels.
+
+Signed-off-by: eelgaev <3100771+eelgaev@users.noreply.github.com>
+---
+ conftest.sh          | 18 ++++++++++++++++++
+ nvidia/nvidia.Kbuild |  1 +
+ nvidia/os-mlock.c    | 10 +++++++++-
+ 3 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/conftest.sh b/conftest.sh
+index 3b33a86..e0c751b 100755
+--- a/conftest.sh
++++ b/conftest.sh
+@@ -5215,6 +5215,24 @@ compile_test() {
+             compile_check_conftest "$CODE" "NV_UNSAFE_FOLLOW_PFN_PRESENT" "" "functions"
+         ;;
+ 
++        follow_pfn)
++            #
++            # Determine if follow_pfn() is present.
++            #
++            # follow_pfn() was removed by commit cb10c28ac82c ("mm: remove
++            # follow_pfn") in v6.10; enterprise kernels (RHEL 9.6+) carry
++            # the removal too. Its replacement, follow_pfnmap_start(), is
++            # exported GPL-only.
++            #
++            CODE="
++            #include <linux/mm.h>
++            void conftest_follow_pfn(void) {
++                follow_pfn();
++            }"
++
++            compile_check_conftest "$CODE" "NV_FOLLOW_PFN_PRESENT" "" "functions"
++        ;;
++
+         drm_plane_atomic_check_has_atomic_state_arg)
+             #
+             # Determine if drm_plane_helper_funcs::atomic_check takes 'state'
+diff --git a/nvidia/nvidia.Kbuild b/nvidia/nvidia.Kbuild
+index 7908ce7..06fd989 100644
+--- a/nvidia/nvidia.Kbuild
++++ b/nvidia/nvidia.Kbuild
+@@ -162,6 +162,7 @@ NV_CONFTEST_FUNCTION_COMPILE_TESTS += vga_tryget
+ NV_CONFTEST_FUNCTION_COMPILE_TESTS += cc_platform_has
+ NV_CONFTEST_FUNCTION_COMPILE_TESTS += seq_read_iter
+ NV_CONFTEST_FUNCTION_COMPILE_TESTS += unsafe_follow_pfn
++NV_CONFTEST_FUNCTION_COMPILE_TESTS += follow_pfn
+ NV_CONFTEST_FUNCTION_COMPILE_TESTS += drm_gem_object_get
+ NV_CONFTEST_FUNCTION_COMPILE_TESTS += drm_gem_object_put_unlocked
+ NV_CONFTEST_FUNCTION_COMPILE_TESTS += add_memory_driver_managed
+diff --git a/nvidia/os-mlock.c b/nvidia/os-mlock.c
+index 46f99a1..17c2efc 100644
+--- a/nvidia/os-mlock.c
++++ b/nvidia/os-mlock.c
+@@ -32,8 +32,16 @@ static inline int nv_follow_pfn(struct vm_area_struct *vma,
+ {
+ #if defined(NV_UNSAFE_FOLLOW_PFN_PRESENT)
+     return unsafe_follow_pfn(vma, address, pfn);
+-#else
++#elif defined(NV_FOLLOW_PFN_PRESENT)
+     return follow_pfn(vma, address, pfn);
++#else
++    //
++    // follow_pfn() is gone and its replacement, follow_pfnmap_start(), is
++    // GPL-only. Without it, looking up user I/O memory
++    // (os_lookup_user_io_memory(), e.g. cudaHostRegisterIoMemory) is not
++    // supported, as in later NVIDIA drivers on such kernels.
++    //
++    return -EINVAL;
+ #endif
+ }
+ 

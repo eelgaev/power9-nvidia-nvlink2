@@ -1,0 +1,309 @@
+From f0b9098c675e94e9b9fb49afd2bdd6a5c49f1fe6 Mon Sep 17 00:00:00 2001
+From: eelgaev <3100771+eelgaev@users.noreply.github.com>
+Subject: [PATCH 1/6] powerpc/powernv: restore NVLink2 NPU PHB probing and PE
+ setup
+
+Commit 562d1e207d32 ("powerpc/powernv: remove the nvlink support")
+dropped the probing of the POWER9 NPU2 NVLink PHBs ("ibm,ioda2-npu2-phb").
+Without it the NPU PCI devices (one per NVLink brick, [1014:04ea]) never
+appear, so GPU drivers cannot train the links or use them, and the CPU
+side of NVLink (coherent GPU memory, ATS) is unreachable.
+
+Restore, for NPU2 only:
+ - PHB type PNV_PHB_NPU_NVLINK / model PNV_PHB_MODEL_NPU2 and probing;
+ - the NPU controller ops (no DMA setup: NVLink DMA is not translated by
+   the NPU PE);
+ - PE assignment at fixup time, sharing one PE between the links of the
+   same GPU (PE#0 is reserved due to a hardware erratum).
+
+Not restored: POWER8 NVLink1, IOMMU group / VFIO pass-through plumbing
+(npu_comp) and the NPU context / ATS API, which is provided by the
+nvlink2-npu module (see the next patches).
+
+The restored code is from v5.12 and was written by Alistair Popple,
+Alexey Kardashevskiy, Frederic Barrat and Reza Arbab among others.
+
+Signed-off-by: eelgaev <3100771+eelgaev@users.noreply.github.com>
+---
+ arch/powerpc/platforms/powernv/pci-ioda.c | 146 +++++++++++++++++++++-
+ arch/powerpc/platforms/powernv/pci.c      |   9 ++
+ arch/powerpc/platforms/powernv/pci.h      |   3 +
+ 3 files changed, 155 insertions(+), 3 deletions(-)
+
+diff --git a/arch/powerpc/platforms/powernv/pci-ioda.c b/arch/powerpc/platforms/powernv/pci-ioda.c
+index a4ac6afd1..9f1d7e4cf 100644
+--- a/arch/powerpc/platforms/powernv/pci-ioda.c
++++ b/arch/powerpc/platforms/powernv/pci-ioda.c
+@@ -45,7 +45,8 @@
+ #include "pci.h"
+ #include "../../../../drivers/pci/pci.h"
+ 
+-static const char * const pnv_phb_names[] = { "IODA1", "IODA2", "NPU_OCAPI" };
++static const char * const pnv_phb_names[] = { "IODA1", "IODA2", "NPU_NVLINK",
++					      "NPU_OCAPI" };
+ 
+ static void pnv_pci_ioda2_set_bypass(struct pnv_ioda_pe *pe, bool enable);
+ static void pnv_pci_configure_bus(struct pci_bus *bus);
+@@ -787,7 +788,7 @@ int pnv_ioda_deconfigure_pe(struct pnv_phb *phb, struct pnv_ioda_pe *pe)
+ 	 * Release from all parents PELT-V. NPUs don't have a PELTV
+ 	 * table
+ 	 */
+-	if (phb->type != PNV_PHB_NPU_OCAPI)
++	if (phb->type != PNV_PHB_NPU_NVLINK && phb->type != PNV_PHB_NPU_OCAPI)
+ 		pnv_ioda_unset_peltv(phb, pe, parent);
+ 
+ 	rc = opal_pci_set_pe(phb->opal_id, pe->pe_number, pe->rid,
+@@ -858,7 +859,7 @@ int pnv_ioda_configure_pe(struct pnv_phb *phb, struct pnv_ioda_pe *pe)
+ 	 * Configure PELTV. NPUs don't have a PELTV table so skip
+ 	 * configuration on them.
+ 	 */
+-	if (phb->type != PNV_PHB_NPU_OCAPI)
++	if (phb->type != PNV_PHB_NPU_NVLINK && phb->type != PNV_PHB_NPU_OCAPI)
+ 		pnv_ioda_set_peltv(phb, pe, true);
+ 
+ 	/* Setup reverse map */
+@@ -1010,6 +1011,116 @@ static struct pnv_ioda_pe *pnv_ioda_setup_bus_PE(struct pci_bus *bus, bool all)
+ 	return pe;
+ }
+ 
++static struct pci_dev *pnv_npu_get_gpu_dev(struct pci_dev *npdev)
++{
++	struct device_node *dn;
++	struct pci_dn *pdn;
++	struct pci_dev *gpdev;
++
++	if (!npdev->dev.of_node)
++		return NULL;
++
++	dn = of_parse_phandle(npdev->dev.of_node, "ibm,gpu", 0);
++	if (!dn)
++		return NULL;
++
++	pdn = PCI_DN(dn);
++	gpdev = pdn ? pci_get_domain_bus_and_slot(pci_domain_nr(pdn->phb->bus),
++						  pdn->busno, pdn->devfn) : NULL;
++	of_node_put(dn);
++
++	return gpdev;
++}
++
++static struct pnv_ioda_pe *pnv_ioda_setup_npu_PE(struct pci_dev *npu_pdev)
++{
++	int pe_num, found_pe = false, rc;
++	long rid;
++	struct pnv_ioda_pe *pe;
++	struct pci_dev *gpu_pdev, *peer;
++	struct pci_dn *npu_pdn;
++	struct pnv_phb *phb = pci_bus_to_pnvhb(npu_pdev->bus);
++
++	/*
++	 * Intentionally leak a reference on the npu device (for
++	 * nvlink only; this is not an opencapi path) to make sure it
++	 * never goes away, as it's been the case all along and some
++	 * work is needed otherwise.
++	 */
++	pci_dev_get(npu_pdev);
++
++	/*
++	 * Due to a hardware errata PE#0 on the NPU is reserved for
++	 * error handling. This means we only have three PEs remaining
++	 * which need to be assigned to four links, implying some
++	 * links must share PEs.
++	 *
++	 * To achieve this we assign PEs such that NPUs linking the
++	 * same GPU get assigned the same PE.
++	 */
++	gpu_pdev = pnv_npu_get_gpu_dev(npu_pdev);
++	for (pe_num = 0; pe_num < phb->ioda.total_pe_num; pe_num++) {
++		pe = &phb->ioda.pe_array[pe_num];
++		if (!pe->pdev)
++			continue;
++
++		peer = pnv_npu_get_gpu_dev(pe->pdev);
++		pci_dev_put(peer);
++		if (peer == gpu_pdev) {
++			/*
++			 * This device has the same peer GPU so should
++			 * be assigned the same PE as the existing
++			 * peer NPU.
++			 */
++			dev_info(&npu_pdev->dev,
++				"Associating to existing PE %x\n", pe_num);
++			npu_pdn = pci_get_pdn(npu_pdev);
++			rid = npu_pdev->bus->number << 8 | npu_pdn->devfn;
++			npu_pdn->pe_number = pe_num;
++			phb->ioda.pe_rmap[rid] = pe->pe_number;
++			pe->device_count++;
++
++			/* Map the PE to this link */
++			rc = opal_pci_set_pe(phb->opal_id, pe_num, rid,
++					OpalPciBusAll,
++					OPAL_COMPARE_RID_DEVICE_NUMBER,
++					OPAL_COMPARE_RID_FUNCTION_NUMBER,
++					OPAL_MAP_PE);
++			WARN_ON(rc != OPAL_SUCCESS);
++			found_pe = true;
++			break;
++		}
++	}
++	pci_dev_put(gpu_pdev);
++
++	if (!found_pe)
++		/*
++		 * Could not find an existing PE so allocate a new
++		 * one.
++		 */
++		return pnv_ioda_setup_dev_PE(npu_pdev);
++	else
++		return pe;
++}
++
++static void pnv_pci_ioda_setup_nvlink(void)
++{
++	struct pci_controller *hose;
++	struct pci_dev *pdev;
++	struct pnv_phb *phb;
++
++	list_for_each_entry(hose, &hose_list, list_node) {
++		phb = hose->private_data;
++		if (phb->type != PNV_PHB_NPU_NVLINK)
++			continue;
++
++		/* PE#0 is needed for error reporting */
++		pnv_ioda_reserve_pe(phb, 0);
++		list_for_each_entry(pdev, &hose->bus->devices, bus_list)
++			pnv_ioda_setup_npu_PE(pdev);
++	}
++}
++
+ static void pnv_pci_ioda_dma_dev_setup(struct pci_dev *pdev)
+ {
+ 	struct pnv_phb *phb = pci_bus_to_pnvhb(pdev->bus);
+@@ -2166,6 +2277,7 @@ static void pnv_pci_enable_bridges(void)
+ 
+ static void pnv_pci_ioda_fixup(void)
+ {
++	pnv_pci_ioda_setup_nvlink();
+ 	pnv_pci_ioda_create_dbgfs();
+ 
+ 	pnv_pci_enable_bridges();
+@@ -2410,6 +2522,7 @@ static void pnv_ioda_release_pe(struct pnv_ioda_pe *pe)
+ 	case PNV_PHB_IODA2:
+ 		pnv_pci_ioda2_release_pe_dma(pe);
+ 		break;
++	case PNV_PHB_NPU_NVLINK:
+ 	case PNV_PHB_NPU_OCAPI:
+ 		break;
+ 	default:
+@@ -2478,6 +2591,15 @@ static void pnv_pci_release_device(struct pci_dev *pdev)
+ 		pnv_ioda_release_pe(pe);
+ }
+ 
++static void pnv_npu_disable_device(struct pci_dev *pdev)
++{
++	struct eeh_dev *edev = pci_dev_to_eeh_dev(pdev);
++	struct eeh_pe *eehpe = edev ? edev->pe : NULL;
++
++	if (eehpe && eeh_ops && eeh_ops->reset)
++		eeh_ops->reset(eehpe, EEH_RESET_HOT);
++}
++
+ static void pnv_pci_ioda_shutdown(struct pci_controller *hose)
+ {
+ 	struct pnv_phb *phb = hose->private_data;
+@@ -2541,6 +2663,14 @@ static const struct pci_controller_ops pnv_pci_ioda_controller_ops = {
+ #endif
+ };
+ 
++static const struct pci_controller_ops pnv_npu_ioda_controller_ops = {
++	.enable_device_hook	= pnv_pci_enable_device_hook,
++	.window_alignment	= pnv_pci_window_alignment,
++	.reset_secondary_bus	= pnv_pci_reset_secondary_bus,
++	.shutdown		= pnv_pci_ioda_shutdown,
++	.disable_device		= pnv_npu_disable_device,
++};
++
+ static const struct pci_controller_ops pnv_npu_ocapi_ioda_controller_ops = {
+ 	.enable_device_hook	= pnv_ocapi_enable_device_hook,
+ 	.release_device		= pnv_pci_release_device,
+@@ -2613,6 +2743,8 @@ static void __init pnv_pci_init_ioda_phb(struct device_node *np,
+ 		phb->model = PNV_PHB_MODEL_P7IOC;
+ 	else if (of_device_is_compatible(np, "ibm,power8-pciex"))
+ 		phb->model = PNV_PHB_MODEL_PHB3;
++	else if (of_device_is_compatible(np, "ibm,power9-npu-pciex"))
++		phb->model = PNV_PHB_MODEL_NPU2;
+ 	else
+ 		phb->model = PNV_PHB_MODEL_UNKNOWN;
+ 
+@@ -2746,6 +2878,9 @@ static void __init pnv_pci_init_ioda_phb(struct device_node *np,
+ 	ppc_md.pcibios_fixup = pnv_pci_ioda_fixup;
+ 
+ 	switch (phb->type) {
++	case PNV_PHB_NPU_NVLINK:
++		hose->controller_ops = pnv_npu_ioda_controller_ops;
++		break;
+ 	case PNV_PHB_NPU_OCAPI:
+ 		hose->controller_ops = pnv_npu_ocapi_ioda_controller_ops;
+ 		break;
+@@ -2798,6 +2933,11 @@ void __init pnv_pci_init_ioda2_phb(struct device_node *np)
+ 	pnv_pci_init_ioda_phb(np, 0, PNV_PHB_IODA2);
+ }
+ 
++void __init pnv_pci_init_npu_phb(struct device_node *np)
++{
++	pnv_pci_init_ioda_phb(np, 0, PNV_PHB_NPU_NVLINK);
++}
++
+ void __init pnv_pci_init_npu2_opencapi_phb(struct device_node *np)
+ {
+ 	pnv_pci_init_ioda_phb(np, 0, PNV_PHB_NPU_OCAPI);
+diff --git a/arch/powerpc/platforms/powernv/pci.c b/arch/powerpc/platforms/powernv/pci.c
+index 771676062..db239f2e2 100644
+--- a/arch/powerpc/platforms/powernv/pci.c
++++ b/arch/powerpc/platforms/powernv/pci.c
+@@ -854,6 +854,15 @@ void __init pnv_pci_init(void)
+ 	for_each_compatible_node(np, NULL, "ibm,ioda3-phb")
+ 		pnv_pci_init_ioda2_phb(np);
+ 
++	/*
++	 * Look for NPU2 NVLink PHBs. The ATS / context management API that
++	 * GPU drivers use on top of them (pnv_npu2_init_context() and
++	 * friends) is provided by the nvlink2-npu module
++	 * (CONFIG_PPC_POWERNV_NVLINK2).
++	 */
++	for_each_compatible_node(np, NULL, "ibm,ioda2-npu2-phb")
++		pnv_pci_init_npu_phb(np);
++
+ 	/* Look for NPU2 OpenCAPI PHBs */
+ 	for_each_compatible_node(np, NULL, "ibm,ioda2-npu2-opencapi-phb")
+ 		pnv_pci_init_npu2_opencapi_phb(np);
+diff --git a/arch/powerpc/platforms/powernv/pci.h b/arch/powerpc/platforms/powernv/pci.h
+index f637e6137..f731a33fd 100644
+--- a/arch/powerpc/platforms/powernv/pci.h
++++ b/arch/powerpc/platforms/powernv/pci.h
+@@ -12,6 +12,7 @@ struct pci_dn;
+ enum pnv_phb_type {
+ 	PNV_PHB_IODA1,
+ 	PNV_PHB_IODA2,
++	PNV_PHB_NPU_NVLINK,
+ 	PNV_PHB_NPU_OCAPI,
+ };
+ 
+@@ -20,6 +21,7 @@ enum pnv_phb_model {
+ 	PNV_PHB_MODEL_UNKNOWN,
+ 	PNV_PHB_MODEL_P7IOC,
+ 	PNV_PHB_MODEL_PHB3,
++	PNV_PHB_MODEL_NPU2,
+ };
+ 
+ #define PNV_PCI_DIAG_BUF_SIZE	8192
+@@ -277,6 +279,7 @@ extern struct iommu_table *pnv_pci_table_alloc(int nid);
+ 
+ extern void pnv_pci_init_ioda_hub(struct device_node *np);
+ extern void pnv_pci_init_ioda2_phb(struct device_node *np);
++extern void pnv_pci_init_npu_phb(struct device_node *np);
+ extern void pnv_pci_init_npu2_opencapi_phb(struct device_node *np);
+ extern void pnv_pci_reset_secondary_bus(struct pci_dev *dev);
+ extern int pnv_eeh_phb_reset(struct pci_controller *hose, int option);
+-- 
+2.43.7

@@ -1,0 +1,22 @@
+# Build environment matching RHEL 8 userspace: kernel RPMs, the nvlink2-npu
+# module and the NVIDIA driver are all compiled with gcc-toolset-13, the
+# compiler that DKMS then uses on RHEL 8 (and RHEL 9) hosts, so modules
+# built later on the target match the kernel exactly.
+#
+# The default base is Red Hat's UBI 8; on a subscribed RHEL host podman
+# passes the subscription in and the full RHEL 8 repos are available.
+# Without a subscription, use a RHEL 8 rebuild, e.g.:
+#   podman build --build-arg BASE=quay.io/rockylinux/rockylinux:8 ...
+ARG BASE=registry.access.redhat.com/ubi8/ubi:latest
+FROM ${BASE}
+
+RUN dnf -y install dnf-plugins-core && \
+    (dnf config-manager --set-enabled powertools 2>/dev/null || \
+     dnf config-manager --set-enabled codeready-builder-for-rhel-8-ppc64le-rpms 2>/dev/null || true) && \
+    dnf -y install rpm-build git make bc bison flex \
+        gcc-toolset-13-gcc gcc-toolset-13-gcc-c++ gcc-toolset-13-binutils \
+        elfutils-libelf-devel openssl openssl-devel perl python3 xz zstd \
+        kmod cpio diffutils patch findutils which rsync && \
+    dnf clean all
+
+WORKDIR /build

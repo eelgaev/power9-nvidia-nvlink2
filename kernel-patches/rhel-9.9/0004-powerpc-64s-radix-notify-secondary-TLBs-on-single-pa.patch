@@ -1,0 +1,49 @@
+From 84caedb3e07ec2ae279c41cfb29b798bf9d522ed Mon Sep 17 00:00:00 2001
+From: eelgaev <3100771+eelgaev@users.noreply.github.com>
+Subject: [PATCH 4/6] powerpc/64s/radix: notify secondary TLBs on single-page
+ flushes
+
+Since the backport of upstream commit 1af5a8109904 ("mmu_notifiers:
+rename invalidate_range notifier") and its series, secondary TLBs (devices
+doing ATS against the CPU page tables) are invalidated from the
+architecture TLB flush code via mmu_notifier_arch_invalidate_secondary_tlbs()
+instead of from the generic mm code. On radix this is called for mm-wide
+and range flushes, but not from radix__flush_tlb_page_psize() or
+radix__flush_tlb_collapsed_pmd().
+
+Single-page flushes are what ptep_clear_flush() uses: copy-on-write after
+fork, page migration, reclaim and KSM. A device caching a translation for
+such a page (e.g. a GPU using NVLink2 ATS) would keep accessing the old
+page after the CPU has moved on, which silently corrupts memory.
+
+Call the notifier from both functions, as the range flushes already do.
+This is a no-op unless a secondary-TLB notifier is registered on the mm.
+
+Signed-off-by: eelgaev <3100771+eelgaev@users.noreply.github.com>
+---
+ arch/powerpc/mm/book3s64/radix_tlb.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/arch/powerpc/mm/book3s64/radix_tlb.c b/arch/powerpc/mm/book3s64/radix_tlb.c
+index 097485392..0642ef2e1 100644
+--- a/arch/powerpc/mm/book3s64/radix_tlb.c
++++ b/arch/powerpc/mm/book3s64/radix_tlb.c
+@@ -945,6 +945,8 @@ void radix__flush_tlb_page_psize(struct mm_struct *mm, unsigned long vmaddr,
+ 			_tlbiel_va_multicast(mm, vmaddr, pid, psize, RIC_FLUSH_TLB);
+ 	}
+ 	preempt_enable();
++	mmu_notifier_arch_invalidate_secondary_tlbs(mm, vmaddr,
++				vmaddr + (1UL << mmu_psize_to_shift(psize)));
+ }
+ 
+ void radix__flush_tlb_page(struct vm_area_struct *vma, unsigned long vmaddr)
+@@ -1357,6 +1359,7 @@ void radix__flush_tlb_collapsed_pmd(struct mm_struct *mm, unsigned long addr)
+ 	}
+ 
+ 	preempt_enable();
++	mmu_notifier_arch_invalidate_secondary_tlbs(mm, addr, end);
+ }
+ #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+ 
+-- 
+2.43.7

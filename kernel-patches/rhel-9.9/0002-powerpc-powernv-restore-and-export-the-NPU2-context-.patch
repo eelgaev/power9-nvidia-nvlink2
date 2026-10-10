@@ -1,0 +1,64 @@
+From f94d76eb2d2756ddb3fd7002bf1d538b831373e9 Mon Sep 17 00:00:00 2001
+From: eelgaev <3100771+eelgaev@users.noreply.github.com>
+Subject: [PATCH 2/6] powerpc/powernv: restore and export the NPU2 context OPAL
+ calls
+
+OPAL_NPU_INIT_CONTEXT and OPAL_NPU_DESTROY_CONTEXT wrappers were removed
+with the NVLink support in commit 562d1e207d32; opal_npu_map_lpar() stayed
+for OpenCAPI but is not exported. The OPAL call trampoline is internal to
+the kernel, so a module cannot issue these calls itself.
+
+Restore the two wrappers and export all three (GPL) for the nvlink2-npu
+module, which binds GPUs to the host LPAR and sets up their NPU
+translation contexts.
+
+Signed-off-by: eelgaev <3100771+eelgaev@users.noreply.github.com>
+---
+ arch/powerpc/include/asm/opal.h            | 3 +++
+ arch/powerpc/platforms/powernv/opal-call.c | 2 ++
+ arch/powerpc/platforms/powernv/opal.c      | 4 ++++
+ 3 files changed, 9 insertions(+)
+
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index 96a4a2aa2..6ecfc3672 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -28,6 +28,9 @@ extern struct device_node *opal_node;
+ 
+ /* API functions */
+ int64_t opal_invalid_call(void);
++int64_t opal_npu_destroy_context(uint64_t phb_id, uint64_t pid, uint64_t bdf);
++int64_t opal_npu_init_context(uint64_t phb_id, int pasid, uint64_t msr,
++			uint64_t bdf);
+ int64_t opal_npu_map_lpar(uint64_t phb_id, uint64_t bdf, uint64_t lparid,
+ 			uint64_t lpcr);
+ int64_t opal_npu_spa_setup(uint64_t phb_id, uint32_t bdfn,
+diff --git a/arch/powerpc/platforms/powernv/opal-call.c b/arch/powerpc/platforms/powernv/opal-call.c
+index f812c74c6..67ae272ac 100644
+--- a/arch/powerpc/platforms/powernv/opal-call.c
++++ b/arch/powerpc/platforms/powernv/opal-call.c
+@@ -271,6 +271,8 @@ OPAL_CALL(opal_xive_get_queue_state,		OPAL_XIVE_GET_QUEUE_STATE);
+ OPAL_CALL(opal_xive_set_queue_state,		OPAL_XIVE_SET_QUEUE_STATE);
+ OPAL_CALL(opal_xive_get_vp_state,		OPAL_XIVE_GET_VP_STATE);
+ OPAL_CALL(opal_signal_system_reset,		OPAL_SIGNAL_SYSTEM_RESET);
++OPAL_CALL(opal_npu_init_context,		OPAL_NPU_INIT_CONTEXT);
++OPAL_CALL(opal_npu_destroy_context,		OPAL_NPU_DESTROY_CONTEXT);
+ OPAL_CALL(opal_npu_map_lpar,			OPAL_NPU_MAP_LPAR);
+ OPAL_CALL(opal_imc_counters_init,		OPAL_IMC_COUNTERS_INIT);
+ OPAL_CALL(opal_imc_counters_start,		OPAL_IMC_COUNTERS_START);
+diff --git a/arch/powerpc/platforms/powernv/opal.c b/arch/powerpc/platforms/powernv/opal.c
+index 03f62a80c..da6ef12b2 100644
+--- a/arch/powerpc/platforms/powernv/opal.c
++++ b/arch/powerpc/platforms/powernv/opal.c
+@@ -1246,5 +1246,9 @@ EXPORT_SYMBOL_GPL(opal_write_oppanel_async);
+ EXPORT_SYMBOL_GPL(opal_int_set_mfrr);
+ EXPORT_SYMBOL_GPL(opal_int_eoi);
+ EXPORT_SYMBOL_GPL(opal_error_code);
++/* NVLink2 context management, used by the nvlink2-npu module */
++EXPORT_SYMBOL_GPL(opal_npu_init_context);
++EXPORT_SYMBOL_GPL(opal_npu_destroy_context);
++EXPORT_SYMBOL_GPL(opal_npu_map_lpar);
+ /* Export the below symbol for NX compression */
+ EXPORT_SYMBOL(opal_nx_coproc_init);
+-- 
+2.43.7
