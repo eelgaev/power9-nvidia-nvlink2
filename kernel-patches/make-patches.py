@@ -3,8 +3,8 @@
 
 Usage: make-patches.py <target> [--tree DIR] [--src-dir DIR]
 
-<target>      kernel-patches/<target>/ directory (e.g. rhel-9.9); the .patch
-              files are (re)written there.
+<target>      kernel-patches/<target>/ directory (e.g. rhel-9.9,
+              mainline-6.12); the .patch files are (re)written there.
 --tree DIR    git checkout of the pristine kernel source (for rhel-9.9:
               linux-5.14.0-741.*.el9_9) whose HEAD is the unmodified tree.
               Reset the tree to its pristine base commit before rerunning.
@@ -12,15 +12,17 @@ Usage: make-patches.py <target> [--tree DIR] [--src-dir DIR]
               into the tree by the module step.
 
 Each step makes exact, checked string replacements and commits; `git
-format-patch` then produces the .patch files. The patches are maintained as
-.patch files in kernel-patches/<target>/; this script is how they were
-generated and how to regenerate them after a rebase.
+format-patch` then produces the source patches 0001-0007. Additional
+target-specific patches (e.g. the config patch 0008 and mainline migration
+patch 0009) are maintained alongside them in kernel-patches/<target>/.
+Reset the tree to its pristine base before regenerating the source patches.
 """
 import argparse
 import os
 import shutil
 import subprocess
 import sys
+from functools import partial
 
 TREE = "."
 SRC = "src"
@@ -54,12 +56,16 @@ def commit(msg):
 # ---------------------------------------------------------------------------
 # 0001: NPU2 NVLink PHB probing and PE setup
 # ---------------------------------------------------------------------------
-def step_0001_phb_probing():
+def step_0001_phb_probing(ioda1=True):
     IODA = "arch/powerpc/platforms/powernv/pci-ioda.c"
     PCI_C = "arch/powerpc/platforms/powernv/pci.c"
     PCI_H = "arch/powerpc/platforms/powernv/pci.h"
 
-    edit(PCI_H, """enum pnv_phb_type {
+    # IODA1 support was removed after v5.14 (mainline commit 474d4c3cae07);
+    # targets with it use the four-entry enum and name list, others the
+    # three-entry ones.
+    if ioda1:
+        edit(PCI_H, """enum pnv_phb_type {
 	PNV_PHB_IODA1,
 	PNV_PHB_IODA2,
 	PNV_PHB_NPU_OCAPI,
@@ -69,6 +75,22 @@ def step_0001_phb_probing():
 	PNV_PHB_NPU_NVLINK,
 	PNV_PHB_NPU_OCAPI,
 };""")
+        names = """static const char * const pnv_phb_names[] = { "IODA1", "IODA2", "NPU_OCAPI" };"""
+        names_new = """static const char * const pnv_phb_names[] = { "IODA1", "IODA2", "NPU_NVLINK",
+					      "NPU_OCAPI" };"""
+    else:
+        edit(PCI_H, """enum pnv_phb_type {
+	PNV_PHB_IODA2,
+	PNV_PHB_NPU_OCAPI,
+};""", """enum pnv_phb_type {
+	PNV_PHB_IODA2,
+	PNV_PHB_NPU_NVLINK,
+	PNV_PHB_NPU_OCAPI,
+};""")
+        names = """static const char * const pnv_phb_names[] = { "IODA2", "NPU_OCAPI" };"""
+        names_new = """static const char * const pnv_phb_names[] = { "IODA2", "NPU_NVLINK",
+					      "NPU_OCAPI" };"""
+    edit(IODA, names, names_new)
     edit(PCI_H, """	PNV_PHB_MODEL_PHB3,
 };""", """	PNV_PHB_MODEL_PHB3,
 	PNV_PHB_MODEL_NPU2,
@@ -89,9 +111,6 @@ extern void pnv_pci_init_npu_phb(struct device_node *np);
 
 	/* Look for NPU2 OpenCAPI PHBs */""")
 
-    edit(IODA, """static const char * const pnv_phb_names[] = { "IODA1", "IODA2", "NPU_OCAPI" };""",
-         """static const char * const pnv_phb_names[] = { "IODA1", "IODA2", "NPU_NVLINK",
-					      "NPU_OCAPI" };""")
     edit(IODA, """	if (phb->type != PNV_PHB_NPU_OCAPI)
 		pnv_ioda_unset_peltv(phb, pe, parent);""",
          """	if (phb->type != PNV_PHB_NPU_NVLINK && phb->type != PNV_PHB_NPU_OCAPI)
@@ -586,6 +605,11 @@ TARGETS = {
                  step_0003_declarations, step_0004_radix_secondary_tlbs,
                  step_0005_module, step_0006_npu_eeh_ordering,
                  step_0007_legacy_mm_exports),
+    "mainline-6.12": (partial(step_0001_phb_probing, ioda1=False),
+                      step_0002_opal_calls, step_0003_declarations,
+                      step_0004_radix_secondary_tlbs, step_0005_module,
+                      step_0006_npu_eeh_ordering,
+                      step_0007_legacy_mm_exports),
 }
 
 

@@ -5,7 +5,8 @@
 //
 //   ats_read [-d gpu] [-m MiB] [-r reps]
 //
-// Run under numactl --membind=<node of the GPU's socket> for local numbers.
+// Run under numactl --cpunodebind=<GPU socket CPU node> for local CPU pages.
+// Do not --membind that node: UVM also needs the GPU memory NUMA node.
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <stdio.h>

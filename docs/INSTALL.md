@@ -59,6 +59,36 @@ bash kernel-patches/rebuild-kernel.sh previous-out additional-patches \
     out-next '<build-suffix>' [jobs]
 ```
 
+### Mainline kernels
+
+The NVLink2 patches have a mainline 6.12 LTS variant
+(`kernel-patches/mainline-6.12`), generated against
+`linux-6.12.<x>.tar.xz` from kernel.org. The build starts from that
+tarball instead of the SRPM; the base configuration is the RHEL 9 ppc64le
+one shipped in the patch directory (`kernel-ppc64le-rhel.config`), so the
+feature set of the reference hosts carries over, with KVM hosting enabled
+by the config patch in the series. Its mainline-only migration patch
+declines page migration while a source folio is under writeback instead of
+panicking during ATS access-counter handling:
+
+```sh
+kernel-patches/build-mainline.sh linux-6.12.<x>.tar.xz \
+    kernel-patches/mainline-6.12/kernel-ppc64le-rhel.config \
+    kernel-patches/mainline-6.12 out [jobs]
+```
+
+Packaging uses the kernel's own rpm-pkg spec: the kernel package carries
+the modules and device trees and installs `/boot` files plus a BLS boot
+entry via `kernel-install` on install (the default entry stays
+unchanged); `kernel-devel` is the external-module build tree
+(`Module.symvers`, scripts, `.config`); `kernel-headers` must not be
+installed, for the same reason as above. On PowerPC the spec packages
+`vmlinux` as `vmlinuz`, like the working RHEL build; the build script
+selects `CONFIG_DEBUG_INFO_NONE=y` explicitly. Disabling the hidden
+`CONFIG_DEBUG_INFO` switch alone allows `olddefconfig` to select DWARF
+again, dramatically enlarging the boot image and modules. The DKMS flow,
+the verification checks and the tests are identical to the RHEL kernel.
+
 The additional patch directory must contain only patches not yet applied to
 the saved tree. The new output directory must not exist; the previous output
 is mounted read-only. The compiler and packaging settings match the full build.

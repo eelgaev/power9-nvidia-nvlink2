@@ -1,0 +1,41 @@
+From: eelgaev <3100771+eelgaev@users.noreply.github.com>
+Subject: [PATCH] mm/migrate_device: defer folios under writeback
+
+migrate_vma_setup() may collect and lock a folio while writeback is still
+in progress. If a driver supplies a destination page, the subsequent
+migrate_vma_pages() call reaches BUG_ON(folio_test_writeback(folio)) in
+__migrate_device_pages(). A POWER9 NVLink2 ATS access-counter migration
+reached this assertion on Linux 6.12.112 and panicked the host.
+
+Migration is best-effort. Skip a source folio still under writeback and
+clear its MIGRATE_PFN_MIGRATE flag. migrate_device_finalize() already
+handles this failure case: it releases the unused destination, restores
+the source page-table entry and unlocks the original folio. The page can
+be migrated on a later attempt after writeback completes.
+
+Signed-off-by: eelgaev <3100771+eelgaev@users.noreply.github.com>
+---
+ mm/migrate_device.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/mm/migrate_device.c b/mm/migrate_device.c
+--- a/mm/migrate_device.c
++++ b/mm/migrate_device.c
+@@ -761,7 +761,16 @@ static void __migrate_device_pages(unsigned long *src_pfns,
+ 			continue;
+ 		}
+ 
+-		BUG_ON(folio_test_writeback(folio));
++		/*
++		 * Writeback can outlive the folio lock taken during collection.
++		 * Migration is best-effort: leave this page where it is and let
++		 * migrate_device_finalize() discard the destination and restore
++		 * the source mapping. Do not transfer a folio under writeback.
++		 */
++		if (folio_test_writeback(folio)) {
++			src_pfns[i] &= ~MIGRATE_PFN_MIGRATE;
++			continue;
++		}
+ 
+ 		if (migrate && migrate->fault_page == page)
+ 			extra_cnt = 1;

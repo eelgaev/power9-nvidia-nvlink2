@@ -92,7 +92,9 @@ for g in "${gpus[@]}"; do
 	bdf=$(echo "${g#*, }" | tr 'A-F' 'a-f' | sed 's/^0000\(....\)/\1/')
 	node=$(cat "/sys/bus/pci/devices/$bdf/numa_node" 2>/dev/null)
 	[[ $node =~ ^[0-9]+$ ]] || node=0
-	bind=(numactl --cpunodebind="$node" --membind="$node")
+	# Pin CPU work to the GPU's socket without constraining GPU-memory nodes.
+	# --membind to the CPU node can prevent UVM from migrating pages to VRAM.
+	bind=(numactl --cpunodebind="$node")
 
 	hdr "GPU $idx (CPU node $node)"
 	"${bind[@]}" ./bw h2d -d "$idx" | sed 's/^/  /'

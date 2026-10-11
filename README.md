@@ -36,7 +36,7 @@ build checks and the hardware validation procedure.
 | | |
 |---|---|
 | Hardware | POWER9 bare metal (OPAL/skiboot), NPU2, V100-SXM2 |
-| Kernel | RHEL 9.9 `5.14.0-741.*.el9_9` + `kernel-patches/rhel-9.9`, built with gcc-toolset-13; the nvlink2-npu module ships in the kernel RPM |
+| Kernel | RHEL 9.9 `5.14.0-741.*.el9_9` + `kernel-patches/rhel-9.9`; or mainline 6.12 LTS (`kernel-patches/mainline-6.12`); both built with gcc-toolset-13, the nvlink2-npu module ships in the kernel RPM |
 | Userspace | RHEL 8 (NVIDIA's ppc64le userspace is RHEL 8 only); RHEL 9 for the kernel side |
 | Driver | NVIDIA 550.54.15 (ppc64le) + `nvidia-patches/550.54.15` |
 
@@ -47,8 +47,9 @@ src/                         nvlink2-npu module sources (built by the kernel
                              build as CONFIG_PPC_POWERNV_NVLINK2=m)
 scripts/kmake                run a build with the kernel's own compiler
 kernel-patches/make-patches.py   regenerates the patch series (per target)
-kernel-patches/<target>      kernel patch series, e.g. rhel-9.9
+kernel-patches/<target>      kernel patch series, e.g. rhel-9.9, mainline-6.12
 kernel-patches/build-kernel.sh   kernel RPMs from the RHEL SRPM (EL8 container)
+kernel-patches/build-mainline.sh kernel RPMs from a kernel.org tarball
 kernel-patches/rebuild-kernel.sh incremental rebuild from a saved compiled tree
 nvidia-patches/550.54.15     NVIDIA driver patches + apply.sh (DKMS PATCH[])
 build/Containerfile.el8      build environment (UBI 8 + gcc-toolset-13)
@@ -70,6 +71,15 @@ KVER='<kernel-release>'
 nvidia-patches/550.54.15/apply.sh &&
 dkms build nvidia/550.54.15 -k "$KVER" --force &&
 dkms install nvidia/550.54.15 -k "$KVER" --force
+```
+
+For the mainline 6.12 LTS series the same flow starts from a kernel.org
+tarball and the configuration shipped in the patch directory:
+
+```sh
+kernel-patches/build-mainline.sh linux-6.12.<x>.tar.xz \
+    kernel-patches/mainline-6.12/kernel-ppc64le-rhel.config \
+    kernel-patches/mainline-6.12 out [jobs]
 ```
 
 ## Credits

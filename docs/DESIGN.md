@@ -37,7 +37,25 @@ notifier infrastructure.
     0005  the nvlink2-npu module (src/)                   (CONFIG_PPC_POWERNV_NVLINK2)
     0006  defer NPU EEH registration until its PEs exist       (initialization order)
     0007  compatible MM lifetime export types for NVLink2 UVM (driver compatibility)
+    0008  enable POWER KVM host modules in the base config     (configuration)
+    0009  defer device migration of folios under writeback    (mainline-6.12 only)
 ```
+
+The series is generated per target by `make-patches.py`
+(`kernel-patches/<target>/`). It targets `rhel-9.9` (the 5.14-based RHEL
+9.9 kernel) and `mainline-6.12` (the 6.12 LTS series, generated against
+`linux-6.12.112`). The steps are identical except that mainline 6.12
+removed IODA1 support, so 0001 uses the three-entry PHB type enum and
+name list there. RHEL-only config plumbing (`Makefile.rhelver`, the
+vendor config patch target) stays in the RHEL build flow;
+`build-mainline.sh` applies the same series to a kernel.org tarball with
+the RHEL 9 ppc64le configuration as base. Patch 0008 is the config change;
+mainline-only patch 0009 handles a device migration writeback failure
+observed during ATS access-counter processing. It clears the migration flag
+for a folio still under writeback; the existing finalize path discards the
+unused destination and restores the source mapping. A build and a DKMS check
+cannot establish hardware correctness: repeat the staged ATS tests on the
+new kernel before treating this correction as validated.
 
 ## Why these are kernel patches (not module code)
 

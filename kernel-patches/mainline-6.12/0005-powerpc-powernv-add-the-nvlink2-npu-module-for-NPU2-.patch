@@ -1,0 +1,1039 @@
+From f3e32aeefabcbd141b8ba10c35d62752bf7df70f Mon Sep 17 00:00:00 2001
+From: eelgaev <3100771+eelgaev@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 22:09:04 +0000
+Subject: [PATCH 5/7] powerpc/powernv: add the nvlink2-npu module for NPU2 GPU
+ support
+
+Add the NPU2 support for GPU drivers as the nvlink2-npu module
+(CONFIG_PPC_POWERNV_NVLINK2, default m on PowerNV):
+
+ - the NPU API Linux removed in v5.3 / v5.13, with the original names and
+   signatures: pnv_pci_get_gpu_dev() / pnv_pci_get_npu_dev() (device-tree
+   NPU <-> GPU lookup) and pnv_npu2_init_context() /
+   pnv_npu2_destroy_context() / pnv_npu2_handle_fault() (per-mm ATS
+   contexts and address translation shootdowns towards the GPUs);
+ - binding the GPUs to the host LPAR via the OPAL context calls restored
+   in the previous patches;
+ - discovery of the NPU2 NVLink PHBs, their MMIO ATSD registers and the
+   mapping of all GPUs at module load.
+
+Based on arch/powerpc/platforms/powernv/npu-dma.c (Linux v5.2 / v5.12,
+RHEL 8), written by Alistair Popple, Alexey Kardashevskiy, Frederic
+Barrat and Reza Arbab among others, with the per-mm context carried by
+the mm's mmu_notifier subscription (mmu_notifier_get_locked()) and
+invalidations arriving through ->arch_invalidate_secondary_tlbs(), which
+the radix TLB flush code calls.
+
+Signed-off-by: eelgaev <3100771+eelgaev@users.noreply.github.com>
+---
+ arch/powerpc/platforms/powernv/Kconfig    |  12 +
+ arch/powerpc/platforms/powernv/Makefile   |   3 +
+ arch/powerpc/platforms/powernv/npu-ats.c  | 551 ++++++++++++++++++++++
+ arch/powerpc/platforms/powernv/npu-dev.c  |  73 +++
+ arch/powerpc/platforms/powernv/npu-lpar.c | 110 +++++
+ arch/powerpc/platforms/powernv/npu-main.c | 144 ++++++
+ arch/powerpc/platforms/powernv/npu.h      |  52 ++
+ 7 files changed, 945 insertions(+)
+ create mode 100644 arch/powerpc/platforms/powernv/npu-ats.c
+ create mode 100644 arch/powerpc/platforms/powernv/npu-dev.c
+ create mode 100644 arch/powerpc/platforms/powernv/npu-lpar.c
+ create mode 100644 arch/powerpc/platforms/powernv/npu-main.c
+ create mode 100644 arch/powerpc/platforms/powernv/npu.h
+
+diff --git a/arch/powerpc/platforms/powernv/Kconfig b/arch/powerpc/platforms/powernv/Kconfig
+index 70a46acc7..da38f31e4 100644
+--- a/arch/powerpc/platforms/powernv/Kconfig
++++ b/arch/powerpc/platforms/powernv/Kconfig
+@@ -19,6 +19,18 @@ config PPC_POWERNV
+ 	select ARCH_SUPPORTS_PER_VMA_LOCK
+ 	default y
+ 
++config PPC_POWERNV_NVLINK2
++	tristate "IBM POWER9 NVLink2 NPU support (NPU2)"
++	depends on PPC_POWERNV && PCI
++	default m
++	help
++	  Support for the POWER9 NVLink2 NPU (nest memory management unit,
++	  address translation services): NPU context management, ATSD
++	  invalidations and the NPU <-> GPU device lookup for GPU drivers
++	  (e.g. NVIDIA V100 on AC922-class systems). Builds as the
++	  nvlink2-npu module and is a no-op on systems without NPU2 NVLink
++	  PHBs.
++
+ config OPAL_PRD
+ 	tristate "OPAL PRD driver"
+ 	depends on PPC_POWERNV
+diff --git a/arch/powerpc/platforms/powernv/Makefile b/arch/powerpc/platforms/powernv/Makefile
+index 19f0fc5c6..6f0d43aeb 100644
+--- a/arch/powerpc/platforms/powernv/Makefile
++++ b/arch/powerpc/platforms/powernv/Makefile
+@@ -31,3 +31,6 @@ obj-$(CONFIG_PPC_VAS)	+= vas.o vas-window.o vas-debug.o vas-fault.o
+ obj-$(CONFIG_OCXL_BASE)	+= ocxl.o
+ obj-$(CONFIG_SCOM_DEBUGFS) += opal-xscom.o
+ obj-$(CONFIG_PPC_SECURE_BOOT) += opal-secvar.o
++
++nvlink2-npu-y			:= npu-main.o npu-dev.o npu-lpar.o npu-ats.o
++obj-$(CONFIG_PPC_POWERNV_NVLINK2) += nvlink2-npu.o
+diff --git a/arch/powerpc/platforms/powernv/npu-ats.c b/arch/powerpc/platforms/powernv/npu-ats.c
+new file mode 100644
+index 000000000..2ab002ce3
+--- /dev/null
++++ b/arch/powerpc/platforms/powernv/npu-ats.c
+@@ -0,0 +1,551 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * NVLink2 address translation services (ATS): per-mm NPU contexts and
++ * address translation shootdowns (ATSD) towards the GPUs.
++ *
++ * From arch/powerpc/platforms/powernv/npu-dma.c (Linux v5.2 and RHEL 8),
++ * Copyright Alistair Popple, IBM Corporation 2015.
++ *
++ * Changes from the in-kernel version:
++ *  - the per-mm context is the mm's mmu_notifier subscription for our ops
++ *    (mmu_notifier_get_locked()/mmu_notifier_put()) instead of the removed
++ *    mm->context.npu_context field;
++ *  - invalidations arrive through ->arch_invalidate_secondary_tlbs(), which
++ *    the radix TLB flush code calls, instead of ->invalidate_range();
++ *  - only the copro mode is supported (no "ibm,nmmu-flush"): explicit
++ *    flush_all_mm() calls would now recurse into our own notifier.
++ */
++#include <linux/export.h>
++#include <linux/mm.h>
++#include <linux/mmu_context.h>
++#include <linux/mmu_notifier.h>
++#include <linux/sched/mm.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++#include <asm/mmu_context.h>
++#include <asm/reg.h>
++#include <asm/tlbflush.h>
++
++#include "npu.h"
++
++/* Protects npu_context::users and the copro accounting it drives. */
++static DEFINE_SPINLOCK(npu_context_lock);
++
++struct npu_context {
++	struct mm_struct *mm;
++	struct pci_dev *npdev[NV_MAX_NPUS][NV_MAX_LINKS];
++	struct mmu_notifier mn;
++
++	/* Number of GPUs (init_context calls) using this context */
++	unsigned int users;
++
++	/* Callback to stop translation requests on a given GPU */
++	void (*release_cb)(struct npu_context *context, void *priv);
++
++	/*
++	 * Private pointer passed to the above callback for usage by
++	 * device drivers.
++	 */
++	void *priv;
++};
++
++#define mn_to_npu_context(x) container_of(x, struct npu_context, mn)
++
++struct mmio_atsd_reg {
++	struct npu *npu;
++	int reg;
++};
++
++/*
++ * Find a free MMIO ATSD register and mark it in use. Return -ENOSPC
++ * if none are available.
++ */
++static int get_mmio_atsd_reg(struct npu *npu)
++{
++	int i;
++
++	for (i = 0; i < npu->mmio_atsd_count; i++) {
++		if (!test_bit(i, &npu->mmio_atsd_usage))
++			if (!test_and_set_bit_lock(i, &npu->mmio_atsd_usage))
++				return i;
++	}
++
++	return -ENOSPC;
++}
++
++static void put_mmio_atsd_reg(struct npu *npu, int reg)
++{
++	clear_bit_unlock(reg, &npu->mmio_atsd_usage);
++}
++
++/* MMIO ATSD register offsets */
++#define XTS_ATSD_LAUNCH 0
++#define XTS_ATSD_AVA    1
++#define XTS_ATSD_STAT   2
++
++static unsigned long get_atsd_launch_val(unsigned long pid, unsigned long psize)
++{
++	unsigned long launch = 0;
++
++	if (psize == MMU_PAGE_COUNT) {
++		/* IS set to invalidate entire matching PID */
++		launch |= PPC_BIT(12);
++	} else {
++		/* AP set to invalidate region of psize */
++		launch |= (u64)mmu_get_ap(psize) << PPC_BITLSHIFT(17);
++	}
++
++	/* PRS set to process-scoped */
++	launch |= PPC_BIT(13);
++
++	/* PID */
++	launch |= pid << PPC_BITLSHIFT(38);
++
++	/* Leave "No flush" (bit 39) 0 so every ATSD performs a flush */
++
++	return launch;
++}
++
++static void mmio_atsd_regs_write(struct mmio_atsd_reg
++			mmio_atsd_reg[NV_MAX_NPUS], unsigned long offset,
++			unsigned long val)
++{
++	struct npu *npu;
++	int i, reg;
++
++	for (i = 0; i < npu_count; i++) {
++		reg = mmio_atsd_reg[i].reg;
++		if (reg < 0)
++			continue;
++
++		npu = mmio_atsd_reg[i].npu;
++		__raw_writeq_be(val, npu->mmio_atsd_regs[reg] + offset);
++	}
++}
++
++static void mmio_invalidate_pid(struct mmio_atsd_reg mmio_atsd_reg[NV_MAX_NPUS],
++				unsigned long pid)
++{
++	unsigned long launch = get_atsd_launch_val(pid, MMU_PAGE_COUNT);
++
++	/* Invalidating the entire process doesn't use a va */
++	mmio_atsd_regs_write(mmio_atsd_reg, XTS_ATSD_LAUNCH, launch);
++}
++
++static void mmio_invalidate_range(struct mmio_atsd_reg
++			mmio_atsd_reg[NV_MAX_NPUS], unsigned long pid,
++			unsigned long start, unsigned long psize)
++{
++	unsigned long launch = get_atsd_launch_val(pid, psize);
++
++	/* Write all VAs first */
++	mmio_atsd_regs_write(mmio_atsd_reg, XTS_ATSD_AVA, start);
++
++	/* Issue one barrier for all address writes */
++	eieio();
++
++	/* Launch */
++	mmio_atsd_regs_write(mmio_atsd_reg, XTS_ATSD_LAUNCH, launch);
++}
++
++static void mmio_invalidate_wait(
++	struct mmio_atsd_reg mmio_atsd_reg[NV_MAX_NPUS])
++{
++	struct npu *npu;
++	int i, reg;
++
++	/* Wait for all invalidations to complete */
++	for (i = 0; i < npu_count; i++) {
++		if (mmio_atsd_reg[i].reg < 0)
++			continue;
++
++		/* Wait for completion */
++		npu = mmio_atsd_reg[i].npu;
++		reg = mmio_atsd_reg[i].reg;
++		while (__raw_readq(npu->mmio_atsd_regs[reg] + XTS_ATSD_STAT))
++			cpu_relax();
++	}
++}
++
++/*
++ * Acquires all the address translation shootdown (ATSD) registers required to
++ * launch an ATSD on all links this npu_context is active on.
++ */
++static void acquire_atsd_reg(struct npu_context *npu_context,
++			struct mmio_atsd_reg mmio_atsd_reg[NV_MAX_NPUS])
++{
++	int i, j;
++	struct npu *npu;
++	struct pci_dev *npdev;
++
++	for (i = 0; i < npu_count; i++) {
++		mmio_atsd_reg[i].reg = -1;
++		for (j = 0; j < NV_MAX_LINKS; j++) {
++			/*
++			 * There are no ordering requirements with respect to
++			 * the setup of struct npu_context, but to ensure
++			 * consistent behaviour we need to ensure npdev[][] is
++			 * only read once.
++			 */
++			npdev = READ_ONCE(npu_context->npdev[i][j]);
++			if (!npdev)
++				continue;
++
++			npu = &npus[i];
++			if (!npu->mmio_atsd_count)
++				continue;
++
++			mmio_atsd_reg[i].npu = npu;
++			mmio_atsd_reg[i].reg = get_mmio_atsd_reg(npu);
++			while (mmio_atsd_reg[i].reg < 0) {
++				mmio_atsd_reg[i].reg = get_mmio_atsd_reg(npu);
++				cpu_relax();
++			}
++			break;
++		}
++	}
++}
++
++/*
++ * Release previously acquired ATSD registers. To avoid deadlocks the registers
++ * must be released in the same order they were acquired above in
++ * acquire_atsd_reg.
++ */
++static void release_atsd_reg(struct mmio_atsd_reg mmio_atsd_reg[NV_MAX_NPUS])
++{
++	int i;
++
++	for (i = 0; i < npu_count; i++) {
++		/*
++		 * We can't rely on npu_context->npdev[][] being the same here
++		 * as when acquire_atsd_reg() was called, hence we use the
++		 * values stored in mmio_atsd_reg during the acquire phase
++		 * rather than re-reading npdev[][].
++		 */
++		if (mmio_atsd_reg[i].reg < 0)
++			continue;
++
++		put_mmio_atsd_reg(mmio_atsd_reg[i].npu, mmio_atsd_reg[i].reg);
++	}
++}
++
++/*
++ * Invalidate a virtual address range
++ */
++static void mmio_invalidate(struct npu_context *npu_context,
++			unsigned long start, unsigned long size)
++{
++	struct mmio_atsd_reg mmio_atsd_reg[NV_MAX_NPUS];
++	unsigned long pid = npu_context->mm->context.id;
++	unsigned long atsd_start = 0;
++	unsigned long end = start + size - 1;
++	int atsd_psize = MMU_PAGE_COUNT;
++
++	/*
++	 * Convert the input range into one of the supported sizes. If the range
++	 * doesn't fit, use the next larger supported size. Invalidation latency
++	 * is high, so over-invalidation is preferred to issuing multiple
++	 * invalidates.
++	 *
++	 * A 4K page size isn't supported by NPU/GPU ATS, so that case is
++	 * ignored.
++	 */
++	if (size == SZ_64K) {
++		atsd_start = start;
++		atsd_psize = MMU_PAGE_64K;
++	} else if (ALIGN_DOWN(start, SZ_2M) == ALIGN_DOWN(end, SZ_2M)) {
++		atsd_start = ALIGN_DOWN(start, SZ_2M);
++		atsd_psize = MMU_PAGE_2M;
++	} else if (ALIGN_DOWN(start, SZ_1G) == ALIGN_DOWN(end, SZ_1G)) {
++		atsd_start = ALIGN_DOWN(start, SZ_1G);
++		atsd_psize = MMU_PAGE_1G;
++	}
++
++	/*
++	 * Loop over all the NPUs this process is active on and launch
++	 * an invalidate.
++	 */
++	acquire_atsd_reg(npu_context, mmio_atsd_reg);
++
++	if (atsd_psize == MMU_PAGE_COUNT)
++		mmio_invalidate_pid(mmio_atsd_reg, pid);
++	else
++		mmio_invalidate_range(mmio_atsd_reg, pid, atsd_start,
++					atsd_psize);
++
++	mmio_invalidate_wait(mmio_atsd_reg);
++
++	/*
++	 * The GPU requires two flush ATSDs to ensure all entries have been
++	 * flushed. We use PID 0 as it will never be used for a process on the
++	 * GPU.
++	 */
++	mmio_invalidate_pid(mmio_atsd_reg, 0);
++	mmio_invalidate_wait(mmio_atsd_reg);
++	mmio_invalidate_pid(mmio_atsd_reg, 0);
++	mmio_invalidate_wait(mmio_atsd_reg);
++
++	release_atsd_reg(mmio_atsd_reg);
++}
++
++static void pnv_npu2_mn_release(struct mmu_notifier *mn,
++				struct mm_struct *mm)
++{
++	struct npu_context *npu_context = mn_to_npu_context(mn);
++
++	/* Call into device driver to stop requests to the NMMU */
++	if (npu_context->release_cb)
++		npu_context->release_cb(npu_context, npu_context->priv);
++
++	/*
++	 * There should be no more translation requests for this PID, but we
++	 * need to ensure any entries for it are removed from the TLB.
++	 */
++	mmio_invalidate(npu_context, 0, ~0UL);
++}
++
++/*
++ * Called by the radix TLB flush code after the CPU TLB invalidation, with
++ * an exclusive end; (0, -1UL) means the whole address space.
++ */
++static void pnv_npu2_mn_invalidate_secondary_tlbs(struct mmu_notifier *mn,
++					struct mm_struct *mm,
++					unsigned long start, unsigned long end)
++{
++	struct npu_context *npu_context = mn_to_npu_context(mn);
++
++	mmio_invalidate(npu_context, start, end - start);
++}
++
++static struct mmu_notifier *pnv_npu2_mn_alloc(struct mm_struct *mm)
++{
++	struct npu_context *npu_context;
++
++	npu_context = kzalloc(sizeof(*npu_context), GFP_KERNEL);
++	if (!npu_context)
++		return ERR_PTR(-ENOMEM);
++
++	npu_context->mm = mm;
++
++	return &npu_context->mn;
++}
++
++static void pnv_npu2_mn_free(struct mmu_notifier *mn)
++{
++	kfree(mn_to_npu_context(mn));
++}
++
++static const struct mmu_notifier_ops nv_nmmu_notifier_ops = {
++	.release = pnv_npu2_mn_release,
++	.arch_invalidate_secondary_tlbs = pnv_npu2_mn_invalidate_secondary_tlbs,
++	.alloc_notifier = pnv_npu2_mn_alloc,
++	.free_notifier = pnv_npu2_mn_free,
++};
++
++static int npu_link_index(struct pci_dev *npdev, u32 *nvlink_index)
++{
++	struct device_node *nvlink_dn;
++	int ret;
++
++	nvlink_dn = of_parse_phandle(npdev->dev.of_node, "ibm,nvlink", 0);
++	if (!nvlink_dn)
++		return -ENODEV;
++
++	ret = of_property_read_u32(nvlink_dn, "ibm,npu-link-index",
++				   nvlink_index);
++	of_node_put(nvlink_dn);
++	if (ret || *nvlink_index >= NV_MAX_LINKS)
++		return -ENODEV;
++
++	return 0;
++}
++
++/*
++ * Setup the nmmu context for the current task in the NPU. This must be
++ * called to setup the context tables before the GPU issues ATRs. pdev
++ * should be a pointed to PCIe GPU device.
++ *
++ * A release callback should be registered to allow a device driver to
++ * be notified that it should not launch any new translation requests
++ * as the final TLB invalidate is about to occur.
++ *
++ * Returns an error if there no contexts are currently available or a
++ * npu_context which should be passed to pnv_npu2_handle_fault().
++ *
++ * mmap_lock must be held in write mode and must not be called from interrupt
++ * context.
++ */
++struct npu_context *pnv_npu2_init_context(struct pci_dev *gpdev,
++			unsigned long flags,
++			void (*cb)(struct npu_context *, void *),
++			void *priv)
++{
++	u32 nvlink_index;
++	struct mm_struct *mm = current->mm;
++	struct mmu_notifier *mn;
++	struct npu *npu;
++	struct npu_context *npu_context;
++	bool first;
++
++	/*
++	 * At present we don't support GPUs connected to multiple NPUs and I'm
++	 * not sure the hardware does either.
++	 */
++	struct pci_dev *npdev = pnv_pci_get_npu_dev(gpdev, 0);
++
++	if (!npdev)
++		/* No nvlink associated with this GPU device */
++		return ERR_PTR(-ENODEV);
++
++	/* The device holds its own reference; npdev[][] needs no other */
++	pci_dev_put(npdev);
++
++	/* We only support DR/PR/HV in pnv_npu2_map_lpar_dev() */
++	if (flags & ~(MSR_DR | MSR_PR | MSR_HV))
++		return ERR_PTR(-EINVAL);
++
++	if (WARN_ON(npu_link_index(npdev, &nvlink_index)))
++		return ERR_PTR(-ENODEV);
++
++	if (!mm || mm->context.id == 0) {
++		/*
++		 * Kernel thread contexts are not supported and context id 0 is
++		 * reserved on the GPU.
++		 */
++		return ERR_PTR(-EINVAL);
++	}
++
++	npu = npu_from_pdev(npdev);
++	if (!npu)
++		return ERR_PTR(-ENODEV);
++
++	/*
++	 * One context per mm: returns the existing subscription with a new
++	 * reference, or allocates and registers one. Parallel allocation is
++	 * prevented by the mmap_lock held for write.
++	 */
++	mn = mmu_notifier_get_locked(&nv_nmmu_notifier_ops, mm);
++	if (IS_ERR(mn))
++		return ERR_CAST(mn);
++	npu_context = mn_to_npu_context(mn);
++
++	spin_lock(&npu_context_lock);
++	first = npu_context->users == 0;
++	if (!first && (npu_context->release_cb != cb ||
++		       npu_context->priv != priv)) {
++		spin_unlock(&npu_context_lock);
++		mmu_notifier_put(mn);
++		return ERR_PTR(-EINVAL);
++	}
++	npu_context->users++;
++	npu_context->release_cb = cb;
++	npu_context->priv = priv;
++	spin_unlock(&npu_context_lock);
++
++	/*
++	 * npdev is a pci_dev pointer setup by the PCI code. We assign it to
++	 * npdev[][] to indicate to the mmu notifiers that an invalidation
++	 * should also be sent over this nvlink. The notifiers don't use any
++	 * other fields in npu_context, so we just need to ensure that when they
++	 * deference npu_context->npdev[][] it is either a valid pointer or
++	 * NULL.
++	 */
++	WRITE_ONCE(npu_context->npdev[npu->index][nvlink_index], npdev);
++
++	/*
++	 * Mark the mm for global TLB invalidations so that they also reach
++	 * the nest MMU, which walks the page tables on behalf of the GPU.
++	 */
++	if (first)
++		mm_context_add_copro(mm);
++
++	return npu_context;
++}
++EXPORT_SYMBOL(pnv_npu2_init_context);
++
++/*
++ * Destroy a context on the given GPU. May free the npu_context if it is no
++ * longer active on any GPUs. Must not be called from interrupt context.
++ */
++void pnv_npu2_destroy_context(struct npu_context *npu_context,
++			struct pci_dev *gpdev)
++{
++	struct npu *npu;
++	struct pci_dev *npdev = pnv_pci_get_npu_dev(gpdev, 0);
++	struct mm_struct *mm = npu_context->mm;
++	u32 nvlink_index;
++	bool last;
++
++	if (WARN_ON(!npdev))
++		return;
++	pci_dev_put(npdev);
++
++	npu = npu_from_pdev(npdev);
++	if (!npu)
++		return;
++	if (WARN_ON(npu_link_index(npdev, &nvlink_index)))
++		return;
++	WRITE_ONCE(npu_context->npdev[npu->index][nvlink_index], NULL);
++
++	spin_lock(&npu_context_lock);
++	last = --npu_context->users == 0;
++	spin_unlock(&npu_context_lock);
++
++	/*
++	 * Drop the copro reference taken by the first init_context. This
++	 * flushes the whole mm (CPU and nest MMU) when the count reaches zero;
++	 * skip it once the address space is gone, there is nothing to flush.
++	 */
++	if (last && mmget_not_zero(mm)) {
++		mm_context_remove_copro(mm);
++		mmput(mm);
++	}
++
++	/* Unregisters and frees the context after an SRCU grace period */
++	mmu_notifier_put(&npu_context->mn);
++}
++EXPORT_SYMBOL(pnv_npu2_destroy_context);
++
++/*
++ * Assumes mmap_lock is held for the contexts associated mm.
++ */
++int pnv_npu2_handle_fault(struct npu_context *context, uintptr_t *ea,
++			unsigned long *flags, unsigned long *status, int count)
++{
++	u64 rc = 0, result = 0;
++	int i, is_write;
++	struct page *page[1];
++
++	/* mmap_lock should be held so the struct_mm must be present */
++	struct mm_struct *mm = context->mm;
++
++	mmap_assert_locked(mm);
++
++	for (i = 0; i < count; i++) {
++		is_write = flags[i] & NPU2_WRITE;
++		rc = get_user_pages_remote(mm, ea[i], 1,
++					   is_write ? FOLL_WRITE : 0,
++					   page, NULL);
++
++		if (rc != 1) {
++			status[i] = rc;
++			result = -EFAULT;
++			continue;
++		}
++
++		/* Make sure partition scoped tree gets a pte */
++		(void)READ_ONCE(*(char *)page_address(page[0]));
++
++		status[i] = 0;
++		put_page(page[0]);
++	}
++
++	return result;
++}
++EXPORT_SYMBOL(pnv_npu2_handle_fault);
++
++void npu_ats_exit(void)
++{
++	/* Wait for pending free_notifier callbacks into this module */
++	mmu_notifier_synchronize();
++}
+diff --git a/arch/powerpc/platforms/powernv/npu-dev.c b/arch/powerpc/platforms/powernv/npu-dev.c
+new file mode 100644
+index 000000000..6fe92cdf1
+--- /dev/null
++++ b/arch/powerpc/platforms/powernv/npu-dev.c
+@@ -0,0 +1,73 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * NPU <-> GPU PCI device lookup through the device tree.
++ *
++ * From arch/powerpc/platforms/powernv/npu-dma.c (Linux v5.12),
++ * Copyright Alistair Popple, IBM Corporation 2015.
++ */
++#include <linux/export.h>
++#include <linux/of.h>
++#include <linux/pci.h>
++#include <asm/pci-bridge.h>
++
++#include "npu.h"
++
++struct pci_dev *npu_get_pci_dev(struct device_node *dn)
++{
++	struct pci_dn *pdn = PCI_DN(dn);
++
++	if (!pdn)
++		return NULL;
++
++	return pci_get_domain_bus_and_slot(pci_domain_nr(pdn->phb->bus),
++					   pdn->busno, pdn->devfn);
++}
++
++/* Given a NPU device get the associated PCI device. */
++struct pci_dev *pnv_pci_get_gpu_dev(struct pci_dev *npdev)
++{
++	struct device_node *dn;
++	struct pci_dev *gpdev;
++
++	if (WARN_ON(!npdev))
++		return NULL;
++
++	if (WARN_ON(!npdev->dev.of_node))
++		return NULL;
++
++	/* Get associated PCI device */
++	dn = of_parse_phandle(npdev->dev.of_node, "ibm,gpu", 0);
++	if (!dn)
++		return NULL;
++
++	gpdev = npu_get_pci_dev(dn);
++	of_node_put(dn);
++
++	return gpdev;
++}
++EXPORT_SYMBOL(pnv_pci_get_gpu_dev);
++
++/* Given the real PCI device get a linked NPU device. */
++struct pci_dev *pnv_pci_get_npu_dev(struct pci_dev *gpdev, int index)
++{
++	struct device_node *dn;
++	struct pci_dev *npdev;
++
++	if (WARN_ON(!gpdev))
++		return NULL;
++
++	/* Not all PCI devices have device-tree nodes */
++	if (!gpdev->dev.of_node)
++		return NULL;
++
++	/* Get associated PCI device */
++	dn = of_parse_phandle(gpdev->dev.of_node, "ibm,npu", index);
++	if (!dn)
++		return NULL;
++
++	npdev = npu_get_pci_dev(dn);
++	of_node_put(dn);
++
++	return npdev;
++}
++EXPORT_SYMBOL(pnv_pci_get_npu_dev);
+diff --git a/arch/powerpc/platforms/powernv/npu-lpar.c b/arch/powerpc/platforms/powernv/npu-lpar.c
+new file mode 100644
+index 000000000..8e4c62db0
+--- /dev/null
++++ b/arch/powerpc/platforms/powernv/npu-lpar.c
+@@ -0,0 +1,110 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Binding GPUs to the host partition (LPAR) and setting up their NPU
++ * translation contexts in firmware.
++ *
++ * From arch/powerpc/platforms/powernv/npu-dma.c (Linux v5.12),
++ * Copyright Alistair Popple, IBM Corporation 2015.
++ */
++#include <linux/export.h>
++#include <linux/pci.h>
++#include <asm/opal.h>
++#include <asm/reg.h>
++
++#include "npu.h"
++
++int pnv_npu2_map_lpar_dev(struct pci_dev *gpdev, unsigned int lparid,
++		unsigned long msr)
++{
++	int ret;
++	struct pci_dev *npdev = pnv_pci_get_npu_dev(gpdev, 0);
++	struct npu *npu;
++
++	if (!npdev)
++		return -ENODEV;
++
++	npu = npu_from_pdev(npdev);
++	pci_dev_put(npdev);
++	if (!npu) {
++		dev_info_once(&gpdev->dev, "Nvlink1 does not support contexts");
++		return 0;
++	}
++
++	dev_dbg(&gpdev->dev, "Map LPAR opalid=%llu lparid=%u\n",
++			npu->opal_id, lparid);
++	/*
++	 * Currently we only support radix and non-zero LPCR only makes sense
++	 * for hash tables so skiboot expects the LPCR parameter to be a zero.
++	 */
++	ret = opal_npu_map_lpar(npu->opal_id, pci_dev_id(gpdev), lparid,
++				0 /* LPCR bits */);
++	if (ret) {
++		dev_err(&gpdev->dev, "Error %d mapping device to LPAR\n", ret);
++		return ret;
++	}
++
++	dev_dbg(&gpdev->dev, "init context opalid=%llu msr=%lx\n",
++			npu->opal_id, msr);
++	ret = opal_npu_init_context(npu->opal_id, 0/*__unused*/, msr,
++				    pci_dev_id(gpdev));
++	if (ret < 0)
++		dev_err(&gpdev->dev, "Failed to init context: %d\n", ret);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(pnv_npu2_map_lpar_dev);
++
++int pnv_npu2_unmap_lpar_dev(struct pci_dev *gpdev)
++{
++	int ret;
++	struct pci_dev *npdev = pnv_pci_get_npu_dev(gpdev, 0);
++	struct npu *npu;
++
++	if (!npdev)
++		return -ENODEV;
++
++	npu = npu_from_pdev(npdev);
++	pci_dev_put(npdev);
++	if (!npu) {
++		dev_info_once(&gpdev->dev, "Nvlink1 does not support contexts");
++		return 0;
++	}
++
++	dev_dbg(&gpdev->dev, "destroy context opalid=%llu\n", npu->opal_id);
++	ret = opal_npu_destroy_context(npu->opal_id, 0/*__unused*/,
++				       pci_dev_id(gpdev));
++	if (ret < 0) {
++		dev_err(&gpdev->dev, "Failed to destroy context: %d\n", ret);
++		return ret;
++	}
++
++	/* Set LPID to 0 anyway, just to be safe */
++	dev_dbg(&gpdev->dev, "Map LPAR opalid=%llu lparid=0\n", npu->opal_id);
++	ret = opal_npu_map_lpar(npu->opal_id, pci_dev_id(gpdev), 0 /*LPID*/,
++				0 /* LPCR bits */);
++	if (ret)
++		dev_err(&gpdev->dev, "Error %d mapping device to LPAR\n", ret);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(pnv_npu2_unmap_lpar_dev);
++
++/*
++ * The kernel used to do this at boot for every device behind an IODA2 PHB
++ * (pnv_npu2_map_lpar() from pnv_pci_ioda_setup_nvlink()); devices without
++ * an NVLink are skipped by pnv_pci_get_npu_dev() returning NULL.
++ */
++void npu_map_all_gpus(void)
++{
++	struct pci_dev *gpdev = NULL;
++	struct pci_dev *npdev;
++
++	for_each_pci_dev(gpdev) {
++		npdev = pnv_pci_get_npu_dev(gpdev, 0);
++		if (!npdev)
++			continue;
++		pci_dev_put(npdev);
++
++		pnv_npu2_map_lpar_dev(gpdev, 0, MSR_DR | MSR_PR | MSR_HV);
++	}
++}
+diff --git a/arch/powerpc/platforms/powernv/npu-main.c b/arch/powerpc/platforms/powernv/npu-main.c
+new file mode 100644
+index 000000000..3dceb55e7
+--- /dev/null
++++ b/arch/powerpc/platforms/powernv/npu-main.c
+@@ -0,0 +1,144 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * nvlink2-npu: POWER9 NPU2 (NVLink2) support for GPU drivers.
++ *
++ * Provides the NPU API that Linux removed in v5.3 / v5.13 (the ATS context
++ * management of pnv_npu2_init_context() and friends, and the NPU device
++ * lookup helpers), with the same names and signatures, for kernels that
++ * still probe the NPU2 NVLink PHBs (see kernel-patches/).
++ *
++ * Based on arch/powerpc/platforms/powernv/npu-dma.c,
++ * Copyright Alistair Popple, IBM Corporation 2015,
++ * and the work of its many contributors, see CREDITS.
++ */
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/pci.h>
++#include <asm/pci-bridge.h>
++
++#include "npu.h"
++
++struct npu npus[NV_MAX_NPUS];
++int npu_count;
++
++/* Find our NPU for an NPU PCI device (a device on an NPU PHB). */
++struct npu *npu_from_pdev(struct pci_dev *npdev)
++{
++	struct pci_controller *hose = pci_bus_to_host(npdev->bus);
++	int i;
++
++	for (i = 0; i < npu_count; i++)
++		if (npus[i].hose == hose)
++			return &npus[i];
++
++	return NULL;
++}
++
++static struct pci_controller *npu_find_hose(struct device_node *dn)
++{
++	struct pci_bus *bus = NULL;
++	struct pci_controller *hose;
++
++	while ((bus = pci_find_next_bus(bus))) {
++		hose = pci_bus_to_host(bus);
++		if (hose && hose->dn == dn)
++			return hose;
++	}
++
++	return NULL;
++}
++
++static int npu_init_one(struct device_node *dn)
++{
++	struct npu *npu;
++	u64 mmio_atsd;
++	int i;
++
++	if (npu_count >= NV_MAX_NPUS) {
++		pr_warn(NPU_DRV_NAME ": more than %d NPUs, ignoring %pOF\n",
++			NV_MAX_NPUS, dn);
++		return -ENOSPC;
++	}
++
++	npu = &npus[npu_count];
++	npu->hose = npu_find_hose(dn);
++	if (!npu->hose) {
++		/* The kernel does not probe NPU PHBs: the patch is missing */
++		pr_err(NPU_DRV_NAME ": %pOF: NPU PHB not probed by the kernel\n",
++		       dn);
++		return -ENODEV;
++	}
++
++	if (of_property_read_u64(dn, "ibm,opal-phbid", &npu->opal_id)) {
++		pr_err(NPU_DRV_NAME ": %pOF: no ibm,opal-phbid\n", dn);
++		return -ENODEV;
++	}
++
++	/*
++	 * Firmware asking for explicit nest MMU flushes is not supported:
++	 * the copro accounting (global TLB invalidations) is used instead,
++	 * as on every POWER9 firmware that ships with AC922 systems.
++	 */
++	if (of_property_read_bool(dn, "ibm,nmmu-flush"))
++		pr_warn(NPU_DRV_NAME ": %pOF: ibm,nmmu-flush ignored\n", dn);
++
++	for (i = 0; i < ARRAY_SIZE(npu->mmio_atsd_regs) &&
++			!of_property_read_u64_index(dn, "ibm,mmio-atsd",
++				i, &mmio_atsd); i++) {
++		npu->mmio_atsd_regs[i] = ioremap(mmio_atsd, 32);
++		if (!npu->mmio_atsd_regs[i])
++			break;
++	}
++	npu->mmio_atsd_count = i;
++	npu->mmio_atsd_usage = 0;
++	npu->dn = of_node_get(dn);
++	npu->index = npu_count++;
++
++	pr_info(NPU_DRV_NAME ": NPU%d (PHB#%04x, %pOF): %d MMIO ATSD registers\n",
++		npu->index, npu->hose->global_number, dn, npu->mmio_atsd_count);
++
++	return 0;
++}
++
++static void npu_free_all(void)
++{
++	int i, j;
++
++	for (i = 0; i < npu_count; i++) {
++		for (j = 0; j < npus[i].mmio_atsd_count; j++)
++			iounmap(npus[i].mmio_atsd_regs[j]);
++		of_node_put(npus[i].dn);
++	}
++	npu_count = 0;
++}
++
++static int __init npu_module_init(void)
++{
++	struct device_node *dn;
++
++	for_each_compatible_node(dn, NULL, "ibm,ioda2-npu2-phb")
++		npu_init_one(dn);
++
++	if (!npu_count) {
++		pr_info(NPU_DRV_NAME ": no usable NVLink2 NPU found\n");
++		return -ENODEV;
++	}
++
++	npu_map_all_gpus();
++
++	return 0;
++}
++
++static void __exit npu_module_exit(void)
++{
++	npu_ats_exit();
++	npu_free_all();
++}
++
++module_init(npu_module_init);
++module_exit(npu_module_exit);
++
++MODULE_DESCRIPTION("POWER9 NPU2 NVLink2 support (ATS contexts, NPU lookup)");
++MODULE_AUTHOR("Alistair Popple (original npu-dma.c), see CREDITS");
++MODULE_LICENSE("GPL v2");
+diff --git a/arch/powerpc/platforms/powernv/npu.h b/arch/powerpc/platforms/powernv/npu.h
+new file mode 100644
+index 000000000..a9109fc05
+--- /dev/null
++++ b/arch/powerpc/platforms/powernv/npu.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * nvlink2-npu: POWER9 NPU2 (NVLink2) support for GPU drivers.
++ *
++ * Internal definitions shared by the module's source files.
++ */
++#ifndef _NVLINK2_NPU_H
++#define _NVLINK2_NPU_H
++
++#include <linux/pci.h>
++#include <linux/of.h>
++#include <asm/mmu.h>		/* NV_MAX_NPUS */
++#include <asm/pci.h>		/* exported API, declared by the kernel patch */
++#include <asm/powernv.h>
++
++#define NPU_DRV_NAME		"nvlink2-npu"
++
++/* Maximum number of NVLinks per NPU */
++#define NV_MAX_LINKS		6
++
++/* Maximum number of ATSD register sets per NPU we use */
++#define NV_NMMU_ATSD_REGS	8
++
++/* One per NPU2 NVLink PHB ("ibm,ioda2-npu2-phb") */
++struct npu {
++	int index;			/* 0 .. npu_count - 1 */
++	struct device_node *dn;		/* PHB device tree node */
++	struct pci_controller *hose;
++	u64 opal_id;			/* "ibm,opal-phbid" */
++
++	/* Address translation shootdown (ATSD) registers */
++	int mmio_atsd_count;
++	unsigned long mmio_atsd_usage;	/* bit lock per register */
++	__be64 __iomem *mmio_atsd_regs[NV_NMMU_ATSD_REGS];
++};
++
++extern struct npu npus[NV_MAX_NPUS];
++extern int npu_count;
++
++/* npu-main.c */
++struct npu *npu_from_pdev(struct pci_dev *npdev);
++
++/* npu-dev.c */
++struct pci_dev *npu_get_pci_dev(struct device_node *dn);
++
++/* npu-ats.c */
++void npu_ats_exit(void);
++
++/* npu-lpar.c */
++void npu_map_all_gpus(void);
++
++#endif /* _NVLINK2_NPU_H */
+-- 
+2.43.7
+
