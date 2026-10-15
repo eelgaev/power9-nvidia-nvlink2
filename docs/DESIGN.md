@@ -136,6 +136,15 @@ watermark first and leaves the pages in place when there is no room; the
 notifications are still cleared. It also passes `__GFP_NOWARN` to these
 allocations, whose failures are handled.
 
+Patches 0004 and 0005 port two ATS fixes from later NVIDIA drivers. 0004
+stops access counter servicing from populating ranges that migrate_vma
+cannot migrate (for example file-backed mappings): the GPU just accessed
+those pages, so they are already populated. ATS faults and the explicit
+migration ioctl keep populating. 0005 makes a fault on a vma that cannot be
+populated (for example VM_IO) cancel only those faults; before, the
+replayable fault path treated it as a global error and cancelled the whole
+fault batch.
+
 ## Not restored
 
 VFIO pass-through of NVLink GPUs (`vfio_pci_nvlink2`, NPU IOMMU groups and

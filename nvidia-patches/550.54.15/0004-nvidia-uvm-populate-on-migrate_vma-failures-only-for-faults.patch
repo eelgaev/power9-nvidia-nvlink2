@@ -1,0 +1,70 @@
+From: eelgaev <3100771+eelgaev@users.noreply.github.com>
+Subject: [PATCH] nvidia-uvm: populate on migrate_vma failures only for faults
+
+When migrate_vma cannot migrate a range (for example a file-backed
+mapping), uvm_migrate_pageable() fell back to populating the whole range
+with get_user_pages for every caller. For ATS access counter servicing
+the pages are already populated, since the GPU just accessed them, so the
+page table walk is repeated work for every notification on such memory.
+
+Add populate_on_migrate_vma_failures to uvm_migrate_args_t, as later
+NVIDIA drivers do: ATS faults keep populating, access counter servicing
+skips, and the explicit migration ioctl keeps its behavior.
+
+Signed-off-by: eelgaev <3100771+eelgaev@users.noreply.github.com>
+---
+diff --git a/nvidia-uvm/uvm_ats_faults.c b/nvidia-uvm/uvm_ats_faults.c
+--- a/nvidia-uvm/uvm_ats_faults.c
++++ b/nvidia-uvm/uvm_ats_faults.c
+@@ -102,6 +102,7 @@
+         .touch                          = fault_service_type,
+         .skip_mapped                    = fault_service_type,
+         .populate_on_cpu_alloc_failures = fault_service_type,
++        .populate_on_migrate_vma_failures = fault_service_type,
+         .user_space_start               = &user_space_start,
+         .user_space_length              = &user_space_length,
+     };
+diff --git a/nvidia-uvm/uvm_migrate.c b/nvidia-uvm/uvm_migrate.c
+--- a/nvidia-uvm/uvm_migrate.c
++++ b/nvidia-uvm/uvm_migrate.c
+@@ -992,6 +992,7 @@
+                 .touch                          = false,
+                 .skip_mapped                    = false,
+                 .populate_on_cpu_alloc_failures = false,
++                .populate_on_migrate_vma_failures = true,
+                 .user_space_start               = &params->userSpaceStart,
+                 .user_space_length              = &params->userSpaceLength,
+             };
+diff --git a/nvidia-uvm/uvm_migrate_pageable.c b/nvidia-uvm/uvm_migrate_pageable.c
+--- a/nvidia-uvm/uvm_migrate_pageable.c
++++ b/nvidia-uvm/uvm_migrate_pageable.c
+@@ -950,8 +950,16 @@
+             if (current->mm != mm && !(current->flags & PF_KTHREAD))
+                 return NV_ERR_NOT_SUPPORTED;
+ 
+-            // Populate pages with uvm_populate_pageable
+-            populate_status = uvm_populate_pageable_vma(vma, start, length, 0, touch, populate_permissions);
++            // Populate pages with uvm_populate_pageable if requested.
++            if (uvm_migrate_args->populate_on_migrate_vma_failures) {
++                populate_status = uvm_populate_pageable_vma(vma, start, length, 0, touch, populate_permissions);
++            }
++            else {
++                *user_space_start = start;
++                *user_space_length = outer - start;
++                populate_status = NV_WARN_NOTHING_TO_DO;
++            }
++
+             if (populate_status == NV_OK) {
+                 *user_space_start = max(vma->vm_start, start);
+                 *user_space_length = min(vma->vm_end, outer) - *user_space_start;
+diff --git a/nvidia-uvm/uvm_migrate_pageable.h b/nvidia-uvm/uvm_migrate_pageable.h
+--- a/nvidia-uvm/uvm_migrate_pageable.h
++++ b/nvidia-uvm/uvm_migrate_pageable.h
+@@ -44,6 +44,7 @@
+     bool                            touch : 1;
+     bool                            skip_mapped : 1;
+     bool                            populate_on_cpu_alloc_failures : 1;
++    bool                            populate_on_migrate_vma_failures : 1;
+     NvU64                           *user_space_start;
+     NvU64                           *user_space_length;
+ } uvm_migrate_args_t;

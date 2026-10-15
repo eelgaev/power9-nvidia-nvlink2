@@ -151,7 +151,7 @@ grep 'Applying patch' \
     "/var/lib/dkms/nvidia/550.54.15/$KVER/ppc64le/log/make.log"
 ```
 
-Both checks must list patches 0001 to 0003. Activate the updated modules at
+Both checks must list patches 0001 to 0005. Activate the updated modules at
 the next controlled boot before checking CUDA's ATS capabilities.
 
 Check that the driver uses the NPU API (i.e. conftest found it):

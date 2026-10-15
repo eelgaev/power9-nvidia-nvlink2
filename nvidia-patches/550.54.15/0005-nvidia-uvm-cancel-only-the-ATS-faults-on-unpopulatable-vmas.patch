@@ -1,0 +1,49 @@
+From: eelgaev <3100771+eelgaev@users.noreply.github.com>
+Subject: [PATCH] nvidia-uvm: cancel only the ATS faults on unpopulatable vmas
+
+A GPU fault on a vma that cannot be populated (for example VM_IO) made
+uvm_ats_service_faults() return NV_ERR_INVALID_ADDRESS. The replayable
+fault path treats any error from it as global and cancels the whole
+fault batch.
+
+Treat NV_ERR_INVALID_ADDRESS as an error of those faults only, as later
+NVIDIA drivers do: leave them out of the serviced masks so the caller
+cancels just them, and continue servicing the rest.
+
+Signed-off-by: eelgaev <3100771+eelgaev@users.noreply.github.com>
+---
+diff --git a/nvidia-uvm/uvm_ats_faults.c b/nvidia-uvm/uvm_ats_faults.c
+--- a/nvidia-uvm/uvm_ats_faults.c
++++ b/nvidia-uvm/uvm_ats_faults.c
+@@ -517,6 +517,15 @@
+         UVM_ASSERT((start + length) <= vma->vm_end);
+ 
+         status = service_ats_requests(gpu_va_space, vma, start, length, access_type, service_type, ats_context);
++
++        // A vma that cannot be populated (for example VM_IO) is an error of
++        // these faults only, not a global one. Leave them out of the serviced
++        // masks so the caller cancels just them.
++        if (status == NV_ERR_INVALID_ADDRESS) {
++            status = NV_OK;
++            continue;
++        }
++
+         if (status != NV_OK)
+             return status;
+ 
+@@ -552,6 +561,15 @@
+         UVM_ASSERT((start + length) <= vma->vm_end);
+ 
+         status = service_ats_requests(gpu_va_space, vma, start, length, access_type, service_type, ats_context);
++
++        // A vma that cannot be populated (for example VM_IO) is an error of
++        // these faults only, not a global one. Leave them out of the serviced
++        // masks so the caller cancels just them.
++        if (status == NV_ERR_INVALID_ADDRESS) {
++            status = NV_OK;
++            continue;
++        }
++
+         if (status != NV_OK)
+             return status;
+ 
