@@ -25,7 +25,7 @@ MM exports when `CONFIG_PPC_POWERNV_NVLINK2` is enabled. A kernel lacking
 that compatibility retains the restriction; a driver reload or reboot into
 the same incompatible kernel does not resolve it.
 
-Verify that both NVIDIA patches were applied to the target build. When
+Verify that all NVIDIA patches were applied to the target build. When
 updating an existing DKMS entry, explicitly rebuild before installation;
 installation alone can reuse an older build. See [INSTALL.md](INSTALL.md).
 

@@ -125,6 +125,17 @@ before allowing that association. Kernel patch 0007 supplies compatible MM
 export types for this platform configuration. Kernel-provided invalidation
 remains the selected path.
 
+GPU access counters make UVM migrate pageable memory that a GPU reads often
+to that GPU's NUMA node. The driver's own allocations on the node (cudaMalloc,
+managed memory) cannot be reclaimed by the kernel. Once they fill the node,
+each migration unmaps the source pages, fails its `__GFP_THISNODE` allocation
+with a page allocation failure warning and maps the pages back, several times
+per second for an application that keeps reading the same host memory.
+NVIDIA patch 0003 checks the destination node's free pages against its low
+watermark first and leaves the pages in place when there is no room; the
+notifications are still cleared. It also passes `__GFP_NOWARN` to these
+allocations, whose failures are handled.
+
 ## Not restored
 
 VFIO pass-through of NVLink GPUs (`vfio_pci_nvlink2`, NPU IOMMU groups and

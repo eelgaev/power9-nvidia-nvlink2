@@ -82,3 +82,4 @@ the kernel; a module cannot make OPAL calls without an exported wrapper.
 | `nvidia-drm` vs RHEL 9.9's DRM API | left out of the DKMS build (`apply.sh`); display/KMS only |
 | `pnv_*` symbols live in the nvlink2-npu module | built into the kernel (`CONFIG_PPC_POWERNV_NVLINK2`); their symbol versions come from the kernel's `Module.symvers` |
 | UVM's ATS enablement on kernels >= 5.9 | nvidia patch 0002 requires the restored production NPU API and non-GPL `mmput` / `__mmdrop` exports before enabling VA-space/mm support. Kernel patch 0007 supplies the MM compatibility for the NVLink2 configuration. Invalidation remains in the kernel-API path (`NV_PNV_NPU2_INIT_CONTEXT_CALLBACK_RETURNS_VOID`), as on RHEL 8 |
+| ATS access counter migrations to a full GPU node fail, warn and repeat | nvidia patch 0003 checks the node's free pages before migrating and passes `__GFP_NOWARN` |

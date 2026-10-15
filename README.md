@@ -15,8 +15,9 @@ as:
   (`CONFIG_PPC_POWERNV_NVLINK2`, built into the kernel), which provides
   the NPU2 API the GPU driver expects (`pnv_pci_get_npu_dev()`,
   `pnv_npu2_init_context()`, ...) with the original names and signatures;
-- **two small patches to NVIDIA 550.54.15** (a removed kernel API and an
-  ATS enablement gate for the restored NPU API);
+- **three small patches to NVIDIA 550.54.15** (a removed kernel API, an
+  ATS enablement gate for the restored NPU API, and skipping ATS
+  migrations into GPU memory that is already full);
 - **tests** for bandwidth, ATS and missed-invalidation corruption.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for what lives where and why, and

@@ -1,0 +1,91 @@
+From: eelgaev <3100771+eelgaev@users.noreply.github.com>
+Subject: [PATCH] nvidia-uvm: skip ATS access counter migrations to full GPU nodes
+
+Access counter notifications for pageable memory make UVM migrate the
+accessed pages to the GPU's NUMA node. The driver's own allocations on
+that node (cudaMalloc, managed memory) are not reclaimable by the kernel.
+Once they fill the node, each migration unmaps the source pages, fails
+the __GFP_THISNODE allocation with a page allocation failure warning, and
+maps the pages back. With a GPU that keeps reading the same host memory
+this repeats several times per second.
+
+Check the free pages of the destination node against its low watermark
+before migrating, and return without migrating when there is no room.
+The notifications are cleared, so the GPU only notifies again after
+another threshold of accesses. Also pass __GFP_NOWARN to the migration
+allocations: their failures are handled.
+
+Signed-off-by: eelgaev <3100771+eelgaev@users.noreply.github.com>
+---
+diff --git a/nvidia-uvm/uvm_ats_faults.c b/nvidia-uvm/uvm_ats_faults.c
+--- a/nvidia-uvm/uvm_ats_faults.c
++++ b/nvidia-uvm/uvm_ats_faults.c
+@@ -29,6 +29,8 @@
+ #include <linux/nodemask.h>
+ #include <linux/mempolicy.h>
+ #include <linux/mmu_notifier.h>
++#include <linux/mmzone.h>
++#include <linux/vmstat.h>
+ 
+ #if UVM_HMM_RANGE_FAULT_SUPPORTED()
+ #include <linux/hmm.h>
+@@ -621,6 +623,34 @@
+     return status;
+ }
+ 
++// The kernel cannot reclaim the GPU memory the driver itself allocates on a
++// GPU NUMA node. Once the node is full, every access counter migration to it
++// unmaps the source pages, fails to allocate and maps them back. Check for
++// room first, and leave the pages where they are when there is none.
++static bool ats_node_has_room(int nid, NvU32 num_pages)
++{
++    pg_data_t *pgdat;
++    unsigned long free_pages = 0;
++    unsigned long reserve = 0;
++    int i;
++
++    if (nid == NUMA_NO_NODE || !node_online(nid))
++        return true;
++
++    pgdat = NODE_DATA(nid);
++    for (i = 0; i < MAX_NR_ZONES; i++) {
++        struct zone *zone = &pgdat->node_zones[i];
++
++        if (!populated_zone(zone))
++            continue;
++
++        free_pages += zone_page_state(zone, NR_FREE_PAGES);
++        reserve += low_wmark_pages(zone);
++    }
++
++    return free_pages > reserve + num_pages;
++}
++
+ NV_STATUS uvm_ats_service_access_counters(uvm_gpu_va_space_t *gpu_va_space,
+                                           struct vm_area_struct *vma,
+                                           NvU64 base,
+@@ -654,6 +684,12 @@
+                          &ats_context->accessed_mask,
+                          &ats_context->prefetch_state.residency_mask);
+ 
++    // Returning NV_OK clears the notifications, so the GPU only asks again
++    // after another threshold of accesses.
++    if (UVM_ID_IS_GPU(ats_context->residency_id) &&
++        !ats_node_has_room(ats_context->residency_node, uvm_page_mask_weight(&ats_context->accessed_mask)))
++        return NV_OK;
++
+     for_each_va_block_subregion_in_mask(subregion, &ats_context->accessed_mask, region) {
+         NV_STATUS status;
+         NvU64 start = base + (subregion.first * PAGE_SIZE);
+diff --git a/nvidia-uvm/uvm_migrate_pageable.c b/nvidia-uvm/uvm_migrate_pageable.c
+--- a/nvidia-uvm/uvm_migrate_pageable.c
++++ b/nvidia-uvm/uvm_migrate_pageable.c
+@@ -37,7 +37,7 @@
+ 
+ static struct kmem_cache *g_uvm_migrate_vma_state_cache __read_mostly;
+ 
+-static const gfp_t g_migrate_vma_gfp_flags = NV_UVM_GFP_FLAGS | GFP_HIGHUSER_MOVABLE | __GFP_THISNODE;
++static const gfp_t g_migrate_vma_gfp_flags = NV_UVM_GFP_FLAGS | GFP_HIGHUSER_MOVABLE | __GFP_THISNODE | __GFP_NOWARN;
+ 
+ // Compute the address needed for copying_gpu to access the given page,
+ // resident on resident_id.
