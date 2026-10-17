@@ -15,10 +15,11 @@ as:
   (`CONFIG_PPC_POWERNV_NVLINK2`, built into the kernel), which provides
   the NPU2 API the GPU driver expects (`pnv_pci_get_npu_dev()`,
   `pnv_npu2_init_context()`, ...) with the original names and signatures;
-- **five small patches to NVIDIA 550.54.15** (a removed kernel API, an
-  ATS enablement gate for the restored NPU API, and three ATS servicing
+- **six small patches to NVIDIA 550.54.15** (a removed kernel API, an
+  ATS enablement gate for the restored NPU API, three ATS servicing
   fixes: skipping migrations into GPU memory that is already full, and two
-  backports from later NVIDIA drivers);
+  backports from later NVIDIA drivers; and a bounded wait so a GPU that
+  stops responding cannot hang every CUDA process until a reboot);
 - **tests** for bandwidth, ATS and missed-invalidation corruption.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for what lives where and why, and
@@ -82,6 +83,46 @@ tarball and the configuration shipped in the patch directory:
 kernel-patches/build-mainline.sh linux-6.12.<x>.tar.xz \
     kernel-patches/mainline-6.12/kernel-ppc64le-rhel.config \
     kernel-patches/mainline-6.12 out [jobs]
+```
+
+## Driver parameters
+
+NVIDIA patch 0006 adds one `nvidia-uvm` parameter:
+
+| Parameter | Default | |
+|---|---|---|
+| `uvm_channel_init_timeout_sec` | `60` | Seconds UVM waits for a GPU to complete the init push of each new internal channel when a process first uses the GPU. `0` waits forever, as NVIDIA's driver does. |
+
+Without the bound, a GPU that has stopped processing work (no Xid, no channel
+error) leaves the first process that opens it spinning in the kernel, unkillable,
+with UVM's locks held. Every later CUDA program and `nvidia-smi` then hangs in D
+state, `nvidia-uvm` cannot be unloaded, and only a reboot recovers. With it, the
+driver logs
+
+```
+nvidia-uvm: GPU <uuid> did not complete the init push of channel <name> in 60 s; setting the global fatal error ...
+```
+
+and sets UVM's global fatal error (as for an unrecoverable ECC error): every
+waiting process gets an error and exits, and UVM refuses work until it is
+reloaded. Then recover without a reboot:
+
+```sh
+# stop the CUDA programs (they now exit), then
+rmmod nvidia_uvm && modprobe nvidia_uvm
+nvidia-smi -r -i <bus id of the GPU from the log>   # if it still does not respond
+```
+
+Set it at load time with `options nvidia-uvm uvm_channel_init_timeout_sec=120`
+in `/etc/modprobe.d/nvidia-uvm.conf`, or at run time through
+`/sys/module/nvidia_uvm/parameters/uvm_channel_init_timeout_sec`. Raise it rather
+than disabling it if a heavily loaded system ever trips it while healthy.
+
+For diagnosis, NVIDIA's own `uvm_debug_prints` (also writable at run time) makes
+a stuck wait log the channel, the GPU and the pending push every few seconds:
+
+```sh
+echo 1 > /sys/module/nvidia_uvm/parameters/uvm_debug_prints   # 0 to stop
 ```
 
 ## Credits

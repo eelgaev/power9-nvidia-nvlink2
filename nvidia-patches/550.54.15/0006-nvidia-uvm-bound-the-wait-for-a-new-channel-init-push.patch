@@ -1,0 +1,107 @@
+From: eelgaev <3100771+eelgaev@users.noreply.github.com>
+Subject: [PATCH] nvidia-uvm: bound the wait for a new channel's init push
+
+Registering a GPU creates UVM's internal channels, and channel_init() waits
+for the GPU to complete each one's init push. The wait only ends on a
+channel error or the global fatal error. A GPU that stops processing work
+without reporting either keeps the registering thread spinning forever:
+uvm_spin_loop() does not check for signals, and the thread holds the locks
+every other process takes when it opens or closes /dev/nvidia-uvm. Those
+processes, nvidia-smi included, hang in D state, the module cannot be
+unloaded, and only a reboot recovers the machine.
+
+On the AC922 this happened with a V100 whose interrupt line had gone
+quiet after hours of ATS traffic: the init push of CE channel 9 on that
+GPU never completed, and the hung thread was found an hour later.
+
+Wait at most uvm_channel_init_timeout_sec (default 60 s, writable at run
+time, 0 restores the unbounded wait). On timeout, log the GPU and channel
+and set the global fatal error, which every UVM wait already checks: the
+registering process gets an error from cuInit, the other waiters return,
+and nvidia-uvm can be unloaded and loaded again without a reboot. The
+fatal error is global by design, since a GPU in this state cannot be
+trusted with the other GPUs' migrations either.
+---
+ nvidia-uvm/uvm_channel.c | 55 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/nvidia-uvm/uvm_channel.c b/nvidia-uvm/uvm_channel.c
+index ac8b54c..8a81ee9 100644
+--- a/nvidia-uvm/uvm_channel.c
++++ b/nvidia-uvm/uvm_channel.c
+@@ -57,6 +57,19 @@ module_param(uvm_channel_gpfifo_loc, charp, S_IRUGO);
+ module_param(uvm_channel_gpput_loc, charp, S_IRUGO);
+ module_param(uvm_channel_pushbuffer_loc, charp, S_IRUGO);
+ 
++// Seconds channel_init() waits for the GPU to complete a new channel's init
++// push. A GPU that stopped processing work without reporting an error would
++// otherwise keep the registering thread spinning forever, unkillable, with the
++// GPU and va_space locks held, so every other process that opens or closes
++// /dev/nvidia-uvm hangs in D state until a reboot. After the timeout UVM sets
++// its global fatal error: all waits return, the processes exit, and the module
++// can be reloaded. 0 waits forever (NVIDIA's behavior).
++static unsigned uvm_channel_init_timeout_sec = 60;
++module_param(uvm_channel_init_timeout_sec, uint, S_IRUGO | S_IWUSR);
++MODULE_PARM_DESC(uvm_channel_init_timeout_sec,
++                 "Seconds to wait for a GPU to complete a new channel's init push before setting the global fatal "
++                 "error (default 60, 0 waits forever)");
++
+ static NV_STATUS manager_create_procfs_dirs(uvm_channel_manager_t *manager);
+ static NV_STATUS manager_create_procfs(uvm_channel_manager_t *manager);
+ static NV_STATUS channel_create_procfs(uvm_channel_t *channel);
+@@ -2145,6 +2158,45 @@ NvU64 uvm_channel_tracking_semaphore_get_gpu_va_in_channel(uvm_channel_t *semaph
+     return uvm_gpu_semaphore_get_gpu_va(semaphore, gpu, uvm_channel_is_proxy(access_channel));
+ }
+ 
++// uvm_push_wait() for the init push, bounded by uvm_channel_init_timeout_sec.
++static NV_STATUS channel_init_wait(uvm_push_t *push)
++{
++    uvm_tracker_entry_t entry;
++    uvm_spin_loop_t spin;
++    NvU64 timeout_ns = (NvU64)uvm_channel_init_timeout_sec * 1000 * 1000 * 1000;
++    NV_STATUS status = NV_OK;
++
++    if (timeout_ns == 0)
++        return uvm_push_wait(push);
++
++    uvm_push_get_tracker_entry(push, &entry);
++    uvm_spin_loop_init(&spin);
++    while (!uvm_tracker_is_entry_completed(&entry)) {
++        UVM_SPIN_LOOP(&spin);
++
++        status = uvm_channel_check_errors(entry.channel);
++        if (status == NV_OK)
++            status = uvm_global_get_status();
++        if (status != NV_OK)
++            return status;
++
++        if (uvm_spin_loop_elapsed(&spin) >= timeout_ns) {
++            UVM_PRINT_FUNC_PREFIX(printk,
++                                  KERN_ERR NVIDIA_UVM_PRETTY_PRINTING_PREFIX,
++                                  " GPU %s did not complete the init push of channel %s in %u s; "
++                                  "setting the global fatal error so waiting processes can exit "
++                                  "(reload nvidia-uvm afterwards)\n",
++                                  uvm_gpu_name(uvm_channel_get_gpu(entry.channel)),
++                                  entry.channel->name,
++                                  uvm_channel_init_timeout_sec);
++            uvm_global_set_fatal_error(NV_ERR_TIMEOUT);
++            return NV_ERR_TIMEOUT;
++        }
++    }
++
++    return NV_OK;
++}
++
+ static NV_STATUS channel_init(uvm_channel_t *channel)
+ {
+     uvm_push_t push;
+@@ -2190,7 +2242,8 @@ static NV_STATUS channel_init(uvm_channel_t *channel)
+ 
+     gpu->parent->host_hal->init(&push);
+ 
+-    status = uvm_push_end_and_wait(&push);
++    uvm_push_end(&push);
++    status = channel_init_wait(&push);
+     if (status != NV_OK) {
+         UVM_ERR_PRINT("Channel '%s' init failed: %s, GPU %s\n",
+                       channel->name,

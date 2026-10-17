@@ -145,6 +145,20 @@ populated (for example VM_IO) cancel only those faults; before, the
 replayable fault path treated it as a global error and cancelled the whole
 fault batch.
 
+Patch 0006 bounds one wait. When a process first uses a GPU, UVM creates its
+internal channels and waits for the GPU to complete each one's init push. That
+wait ends only on a channel error or UVM's global fatal error; it does not
+check for signals (NVIDIA's own TODO in `uvm_spin_loop()`). A GPU that stops
+processing work without reporting an error therefore leaves the registering
+thread spinning forever with the locks every other process needs to open or
+close `/dev/nvidia-uvm`, and the machine needs a reboot. On the AC922 this
+happened to a V100 whose interrupt line had gone quiet after hours of ATS
+traffic. After `uvm_channel_init_timeout_sec` (default 60 s) the patch sets the
+global fatal error instead, which every UVM wait already checks, so all
+waiters return and the module can be reloaded. It is global by design: a GPU
+in that state cannot be trusted with the other GPUs' migrations either. See
+the README's "Driver parameters".
+
 ## Not restored
 
 VFIO pass-through of NVLink GPUs (`vfio_pci_nvlink2`, NPU IOMMU groups and
